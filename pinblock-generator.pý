@@ -1,0 +1,149 @@
+from Crypto.Cipher import DES3, AES
+import configparser
+from Crypto import Random
+import socket
+import struct
+import binascii
+import sys
+
+formato_pinblock = [
+    ("PINBLOCK FORMAT 0 (Code 01)", "PINBLOCK_0"),
+    ("PINBLOCK FORMAT 4 (Code 48 - AES)", "PINBLOCK_4"),
+]
+
+def pad_iso9797_m1(data):
+    if len(data) % 8 != 0:
+        padding_len = 8 - (len(data) % 8)
+        data += b'\x00' * padding_len
+    return data
+
+def generate_pin_block_0(key_raw, pan, pin):
+    # Formatting PAN and PIN
+    formatted_pan = format0_pan(pan)
+    formatted_pin = format0_pin(pin)
+    
+    print("Plain text PIN field ["+formatted_pin+"]")
+    print("Plain text PAN field ["+formatted_pan+"]")
+    
+    pin_bytes = bytes.fromhex(formatted_pin.replace(' ', ''))
+    pan_bytes = bytes.fromhex(formatted_pan.replace(' ', ''))
+    key = bytes.fromhex(key_raw.replace(' ', ''))
+    
+    # XOR PIN PAN
+    val_xor = ''
+    val_xor = bytes(a ^ b for (a, b) in zip(pin_bytes, pan_bytes))
+
+    padded_data = pad_iso9797_m1(val_xor)
+
+    # Encrypting PIN Block with TPK
+    cipher = DES3.new(key, DES3.MODE_ECB)
+    encrypted_pin_block = cipher.encrypt(padded_data)
+    enciphered_PIN = encrypted_pin_block.hex().upper()
+
+    return enciphered_PIN
+
+def format0_pan(pan):
+    pan_format = '0' * 4 + pan
+    return ''.join(pan_format)
+
+def format0_pin(pin):
+    pin_length = len(pin)
+    pin_length_hex = hex(pin_length)[2:].upper()[:1] 
+    pin_format = '0' + pin_length_hex + pin + 'F' * (14 - pin_length)
+    return ''.join(pin_format)
+
+########################
+
+def generate_pin_block_4(key_aes_raw, pan, pin):
+    # Formatting PAN and PIN
+    formatted_pan = format4_pan(pan)
+    formatted_pin = format4_pin(pin)
+    
+    print("Plain text PIN field ["+formatted_pin+"]")
+    print("Plain text PAN field ["+formatted_pan+"]")
+    
+    # Padding PIN Block
+    pin_block = bytes.fromhex(formatted_pin.replace(' ', ''))
+    key_aes = bytes.fromhex(key_aes_raw.replace(' ', ''))
+
+    # Encrypting PIN Block with TPK
+    mode = AES.MODE_ECB
+    obj = AES.new(key_aes, mode)
+    enc_pin_block = obj.encrypt(pin_block)
+    
+    inter_BK_A = enc_pin_block.hex().upper()
+    xor_interA = bytes.fromhex(inter_BK_A.replace(' ', ''))
+    xor_PAN_in = bytes.fromhex(formatted_pan.replace(' ', ''))
+    
+    # XORing PIN Block with formatted PAN
+    val_inB = ''
+    val_inB = bytes(a ^ b for (a, b) in zip(xor_interA, xor_PAN_in))
+    
+    mode = AES.MODE_ECB
+    obj = AES.new(key_aes, mode)
+    enciphered_PIN_raw = obj.encrypt(val_inB)
+    enciphered_PIN = enciphered_PIN_raw.hex().upper()
+
+    return enciphered_PIN
+
+def format4_pan(pan):
+    pan_length = len(pan)
+    m_lenght = pan_length - 12
+    m = hex(m_lenght)[2:].upper()[:1]
+    pan_format = (m + pan + '0' * (31 - pan_length)).upper()
+    return ''.join(pan_format)
+
+def format4_pin(pin):
+    pin_length = len(pin)
+    pin_length_hex = hex(pin_length)[2:].upper()[:1] 
+    rnd_file = Random.new()
+    rnd = rnd_file.read(8)
+    rnd_fill = rnd.hex()
+    pin_format = '4' + pin_length_hex + pin + 'F' * (14 - pin_length) + rnd_fill.upper()
+    return ''.join(pin_format)
+
+#########################
+
+def switch_format(option):
+    if option < 1 or option > len(formato_pinblock):
+        print("Opcion no valida!")
+        return
+
+    descripcion, opcion = formato_pinblock[option - 1]
+    print(f"\nHas seleccionado: {descripcion}")
+
+    config = configparser.ConfigParser()
+    config.read("conf_pinblock.ini")
+
+    key = config.get(opcion, "key")
+    pan = config.get(opcion, "pan")
+    pin = config.get(opcion, "pin")
+    
+    if(opcion=="PINBLOCK_0"):
+        pin_block = generate_pin_block_0(key, pan, pin)
+        print("Generated PIN Block ISO-0 ["+pin_block+"]")
+    elif(opcion=="PINBLOCK_4"):
+        pin_block = generate_pin_block_4(key, pan, pin)
+        print("Generated PIN Block ISO-4 ["+pin_block+"]")
+
+def main():
+    while True:
+        print("Seleccione opcion para EMV:")
+        print("(0) - Salir")
+        print("(1) - PINBLOCK FORMAT 0 (Code 01)")
+        print("(2) - PINBLOCK FORMAT 4 (Code 48) - AES")
+        try:
+            print("Nota: Opciones con ** aun no estan implementadas.")
+            option = int(input("\nSelecciona una opcion (1-2) o 0 para salir: "))
+            
+            if option == 0:
+                print("Saliendo del programa.")
+                break
+            else:
+                switch_format(option)
+                break
+        except ValueError:
+            print("Entrada no valida. Por favor, ingrese un numero.")
+
+if __name__ == "__main__":
+    main()
