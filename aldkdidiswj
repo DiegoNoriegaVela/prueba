@@ -1,12 +1,41 @@
-/* Esquema destino */
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'sbp_lam')
+/* ========= Esquema destino ========= */
+IF SCHEMA_ID('sbp_lam') IS NULL
     EXEC('CREATE SCHEMA sbp_lam AUTHORIZATION dbo;');
 GO
 
-/* Vista: Group Query (campos requeridos por SBP) */
+/* ========= Vista 1: Account Query ========= */
+/* Devuelve una fila por usuario, con RolesGroupsProfiles como lista de tokens SID:x|PID:y */
+CREATE OR ALTER VIEW sbp_lam.vw_AccountQuery AS
+WITH RolesPorUsuario AS (
+    SELECT
+        up.UsuarioID,
+        STRING_AGG(
+            CONCAT('SID:', CAST(up.SistemaID AS varchar(50)), '|PID:', CAST(up.PerfilID AS varchar(50))),
+            '; '
+        ) WITHIN GROUP (ORDER BY up.SistemaID, up.PerfilID) AS RolesGroupsProfiles
+    FROM security.MaeUsuarioPerfil AS up
+    GROUP BY up.UsuarioID
+)
+SELECT
+    u.UsuarioID                              AS UsuarioID,
+    u.Username                               AS Username,
+    CAST(NULL AS varchar(50))                AS ScotiaID,            -- no existe en SIMP
+    u.Nombres                                AS Name,
+    u.Apellidos                              AS LastName,
+    CAST(NULL AS varchar(256))               AS Email,               -- no existe en SIMP
+    u.Activo                                 AS Active,
+    ru.RolesGroupsProfiles                   AS RolesGroupsProfiles, -- tokens SID:x|PID:y separados por "; "
+    CAST(NULL AS varchar(50))                AS AccountType,         -- no existe en SIMP
+    CAST(NULL AS bit)                        AS Privileged           -- no existe en SIMP
+FROM security.MaeUsuario AS u
+LEFT JOIN RolesPorUsuario AS ru
+       ON ru.UsuarioID = u.UsuarioID;
+GO
+
+/* ========= Vista 2: Group Query ========= */
+/* Una fila por (SistemaID, PerfilID). Usa el mismo token en RolesGroupsProfiles. */
 CREATE OR ALTER VIEW sbp_lam.vw_GroupQuery AS
 WITH Capabilities AS (
-    /* Lista de capacidades por perfil (Menu/Recurso) */
     SELECT
         pmr.SistemaID,
         pmr.PerfilID,
@@ -17,23 +46,21 @@ WITH Capabilities AS (
             ),
             '; '
         ) WITHIN GROUP (ORDER BY pmr.MenuID, pmr.RecursoID) AS CapabilityFunctions
-    FROM (
-        /* DISTINCT para evitar duplicados si existieran */
-        SELECT DISTINCT SistemaID, PerfilID, MenuID, RecursoID
-        FROM security.MaePerfilMenuRecurso
-    ) AS pmr
-    LEFT JOIN security.MaeMenu    AS m ON m.SistemaID = pmr.SistemaID AND m.MenuID    = pmr.MenuID
+    FROM (SELECT DISTINCT SistemaID, PerfilID, MenuID, RecursoID FROM security.MaePerfilMenuRecurso) AS pmr
+    LEFT JOIN security.MaeMenu    AS m ON m.SistemaID = pmr.SistemaID AND m.MenuID = pmr.MenuID
     LEFT JOIN security.MaeRecurso AS r ON r.RecursoID = pmr.RecursoID
     GROUP BY pmr.SistemaID, pmr.PerfilID
 )
 SELECT
-    p.SistemaID               AS SistemaID,         -- Roles/Groups/Profiles (parte 1)
-    p.PerfilID                AS PerfilID,          -- Roles/Groups/Profiles (parte 2)
-    p.Descripcion             AS Descriptions,      -- Descripción del perfil
-    cap.CapabilityFunctions   AS CapabilityFunctions, -- Lista de capacidades
-    CAST(NULL AS BIT)         AS Privileged         -- No almacenado en SIMP
+    CONCAT('SID:', CAST(p.SistemaID AS varchar(50)), '|PID:', CAST(p.PerfilID AS varchar(50)))
+                                          AS RolesGroupsProfiles,   -- mismo token que en Account
+    p.SistemaID                            AS SistemaID,
+    p.PerfilID                             AS PerfilID,
+    p.Descripcion                          AS Descriptions,         -- descripción del perfil
+    cap.CapabilityFunctions                AS CapabilityFunctions,  -- lista de capacidades
+    CAST(NULL AS bit)                      AS Privileged            -- no existe en SIMP
 FROM security.MaePerfil AS p
-LEFT JOIN Capabilities  AS cap
+LEFT JOIN Capabilities AS cap
        ON cap.SistemaID = p.SistemaID
       AND cap.PerfilID  = p.PerfilID;
 GO
