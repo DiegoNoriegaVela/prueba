@@ -1,0 +1,53 @@
+/* ─────────────────────────────────────────────────────────────
+   Esquema destino
+   ───────────────────────────────────────────────────────────── */
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'sbp_lam')
+    EXEC('CREATE SCHEMA sbp_lam AUTHORIZATION dbo;');
+GO
+
+/* ─────────────────────────────────────────────────────────────
+   Vista: Account Query (Solicitud SBP)
+   Campos requeridos por SBP, en el orden indicado:
+   - Login ID / Username
+   - Scotia ID              -> NULL (no existe)
+   - Name, LastName
+   - Email                  -> NULL (no existe)
+   - Active
+   - Roles/Groups/Profiles  -> lista concatenada (Sistema y Perfil)
+   - Account Type           -> NULL (no existe)
+   - Privileged             -> NULL (no existe)
+   ───────────────────────────────────────────────────────────── */
+CREATE OR ALTER VIEW sbp_lam.vw_AccountQuery AS
+WITH RolesPorUsuario AS (
+    SELECT
+        up.UsuarioID,
+        STRING_AGG(
+            CONCAT(
+                'Sistema: ', ISNULL(s.DescripcionCorta, CAST(up.SistemaID AS nvarchar(50))),
+                ' | Perfil: ', ISNULL(p.Descripcion, CAST(up.PerfilID AS nvarchar(50)))
+            ),
+            '; '
+        ) WITHIN GROUP (ORDER BY up.SistemaID, up.PerfilID) AS RolesGroupsProfiles
+    FROM security.MaeUsuarioPerfil AS up
+    LEFT JOIN security.MaeSistema AS s
+           ON s.SistemaID = up.SistemaID
+    LEFT JOIN security.MaePerfil AS p
+           ON p.SistemaID = up.SistemaID
+          AND p.PerfilID  = up.PerfilID
+    GROUP BY up.UsuarioID
+)
+SELECT
+    u.UsuarioID                                AS UsuarioID,             -- Login ID
+    u.Username                                 AS Username,              -- Username
+    CAST(NULL AS nvarchar(50))                 AS ScotiaID,              -- no existe
+    u.Nombres                                  AS Name,                  -- Nombres
+    u.Apellidos                                AS LastName,              -- Apellidos
+    CAST(NULL AS nvarchar(256))                AS Email,                 -- no existe
+    u.Activo                                   AS Active,                -- estado
+    ru.RolesGroupsProfiles                     AS RolesGroupsProfiles,   -- agregado
+    CAST(NULL AS nvarchar(50))                 AS AccountType,           -- no existe
+    CAST(NULL AS bit)                          AS Privileged             -- no existe
+FROM security.MaeUsuario AS u
+LEFT JOIN RolesPorUsuario AS ru
+       ON ru.UsuarioID = u.UsuarioID;
+GO
