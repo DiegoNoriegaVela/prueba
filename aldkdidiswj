@@ -894,3 +894,61 @@ public class McBatchSender {
 }
 
 
+# =============================================================================
+# McBatchSender - Parametros de configuracion
+# =============================================================================
+# Uso general:
+#   java McBatchSender <seccion>
+#   <seccion> = nombre del perfil (p.ej. MIP, GCO)
+#
+# Claves:
+#   host              -> IP o DNS del receptor.
+#   port              -> Puerto TCP del receptor (1..65535).
+#   connectTimeoutMs  -> Timeout de conexion (ms) al abrir el socket.
+#   soTimeoutMs       -> Timeout de lectura (ms) al esperar respuestas.
+#   chunkSize         -> Tamano maximo (bytes) por trama de datos.
+#   dataFilePath      -> Archivo de entrada a enviar (ruta relativa a user.dir o absoluta).
+#   historyFilePath   -> Archivo de historico (se crea si no existe).
+#   acceptedCode      -> Lista separada por comas para OK inicial y OK final; tambien se usa en el
+#                        trailer. Debe existir al menos UN valor de 7 caracteres (p.ej. 9980100).
+#   alreadySentSubstring -> Si aparece en la primera respuesta, se considera "ya enviado" (OK).
+#   defaultFailCode   -> Codigo a registrar cuando ocurre cualquier error.
+#   nameTemplate      -> Plantilla del nombre a enviar. Tokens: {file},{julian},{yyyymmdd},{yy},{mm},{dd}
+#                        {julian} = dia del anio (DDD).
+#   fileNameTemplate  -> Se usa SOLO si no pasas FILE_NAME por CLI. Debe generar EXACTAMENTE 9 chars.
+#                        Soporta: literal 9 chars (R27802840), {rand} (4 digitos), {ddmm} (dia+mes).
+#   codePage          -> EBCDIC a usar (Cp037/Cp500/Cp1047) segun el hub.
+#   date              -> (Opcional) AAAAMMDD para fijar fecha usada en plantillas; si falta, usa hoy.
+#
+# =============================================================================
+
+
+[MIP]
+host=10.238.183.1
+port=6246
+connectTimeoutMs=60000
+soTimeoutMs=60000
+chunkSize=980
+dataFilePath=MIPFILE_DATI
+historyFilePath=MIPFILE_HISTORY_R
+acceptedCode=9980100
+alreadySentSubstring=9288W
+defaultFailCode=9980101
+nameTemplate=00401{file}{julian}
+fileNameTemplate=R2780{rand}
+codePage=Cp037
+
+[GCO]
+host=10.238.183.1
+port=6246
+connectTimeoutMs=60000
+soTimeoutMs=60000
+chunkSize=980
+dataFilePath=GCOFILE_DATI
+historyFilePath=GCOFILE_HISTORY_R
+acceptedCode=9980100
+alreadySentSubstring=9288W
+defaultFailCode=9980101
+nameTemplate=00401{file}{julian}
+fileNameTemplate=R1190{rand}
+codePage=Cp037
