@@ -479,11 +479,11 @@ public class McBatchSender {
         }
 
         // --------------------------- Opcion 2: Reporte -------------------------
-
         /**
          * Flujo de reporte.
-         * Arma nombre base desde reportNameTemplate, consulta 01..99, acumula respuesta
-         * y escribe archivo de confirmacion procesado (report.process=Y) o crudo (N).
+         * - Lee UNA sola respuesta por cada consulta (01..99), como el original.
+         * - Si report.process=Y, procesa headers+details con el bloque entre corchetes.
+         * - Si report.process=N, escribe el contenido crudo tal cual llega del servidor.
          */
         private void runReport() {
             logger.info("=== OPCION 2: Reporte ===");
@@ -503,7 +503,7 @@ public class McBatchSender {
             }
             logger.info("FILE_NAME efectivo: " + effectiveFileName);
 
-            // Nombre base de consulta (desde INI)
+            // Nombre base de consulta (desde INI). Equivalente al original "10101{file}{julian}"
             String nameBase = applyNameTemplate(cfg.reportNameTemplate, effectiveFileName, date);
             logger.info("Nombre base de reporte: " + nameBase);
 
@@ -520,6 +520,7 @@ public class McBatchSender {
                 sock.setSoTimeout(cfg.soTimeoutMs);
                 logger.info("Estado de conexion con el MIP: " + sock.isConnected());
 
+                // Consulta secuencias 01..99. Por CADA una se lee UN solo bloque (lectura corta/timeout)
                 for (int i = 1; i <= 99; i++) {
                     String secStr = String.format("%02d", i);
                     String queryName = nameBase + secStr;
@@ -531,17 +532,11 @@ public class McBatchSender {
                     rawAcc.setLength(0);
                     fmtAcc.setLength(0);
 
-                    boolean moreData = true;
-                    while (moreData) {
-                        String chunk = readResponse(sock, cfg.codePage);
-                        rawAcc.append(chunk);                       // crudo
-                        fmtAcc.append("[").append(chunk).append("]\n"); // con corchetes para parser
+                    String chunk = readResponse(sock, cfg.codePage);
+                    rawAcc.append(chunk);                           // crudo, tal cual llega del servidor
+                    fmtAcc.append("[").append(chunk).append("]\n"); // un solo par de corchetes para el parser legacy
 
-                        if (containsAnyAcceptedPrefix(rawAcc.toString(), cfg.acceptedCodes)) {
-                            moreData = false;
-                        }
-                    }
-
+                    // Archivo encontrado si coincide exactamente con algun acceptedCode
                     if (containsAny(rawAcc.toString(), cfg.acceptedCodes)) {
                         logger.info("Archivo encontrado [OK]");
                         found = true;
@@ -554,9 +549,8 @@ public class McBatchSender {
                 if (found) {
                     logger.info("*** Generando archivo de respuesta (Reporte)...");
                     final String dataToWrite = cfg.reportProcess
-                            ? orderDetails(fmtAcc.toString(), acceptedFirst)  // procesado
-                            : rawAcc.toString();                               // crudo
-
+                            ? orderDetails(fmtAcc.toString(), acceptedFirst)  // procesado (headers+details), como el original
+                            : rawAcc.toString();                               // crudo (exactamente lo recibido)
                     writeDataToFile(date, dataToWrite, effectiveFileName);
                     logger.info("*** Reporte generado: [OK]");
                 } else {
