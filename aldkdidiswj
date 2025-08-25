@@ -481,9 +481,10 @@ public class McBatchSender {
         // --------------------------- Opcion 2: Reporte -------------------------
         /**
          * Flujo de reporte.
-         * - Lee UNA sola respuesta por cada consulta (01..99), como el original.
-         * - Si report.process=Y, procesa headers+details con el bloque entre corchetes.
+         * - Lee UN solo bloque por secuencia (01..99), como el original (lectura one-shot 1024B max).
+         * - Si report.process=Y, procesa headers+details con el bloque entre corchetes (parser legacy).
          * - Si report.process=N, escribe el contenido crudo tal cual llega del servidor.
+         * - Si el parser falla, hace fallback al crudo (manteniendo el comportamiento del legado).
          */
         private void runReport() {
             logger.info("=== OPCION 2: Reporte ===");
@@ -520,7 +521,7 @@ public class McBatchSender {
                 sock.setSoTimeout(cfg.soTimeoutMs);
                 logger.info("Estado de conexion con el MIP: " + sock.isConnected());
 
-                // Consulta secuencias 01..99. Por CADA una se lee UN solo bloque (lectura corta/timeout)
+                // Consulta secuencias 01..99. Por CADA una se lee UN solo bloque (one-shot 1024B)
                 for (int i = 1; i <= 99; i++) {
                     String secStr = String.format("%02d", i);
                     String queryName = nameBase + secStr;
@@ -532,9 +533,10 @@ public class McBatchSender {
                     rawAcc.setLength(0);
                     fmtAcc.setLength(0);
 
-                    String chunk = readResponse(sock, cfg.codePage);
-                    rawAcc.append(chunk);                           // crudo, tal cual llega del servidor
-                    fmtAcc.append("[").append(chunk).append("]\n"); // un solo par de corchetes para el parser legacy
+                    // Lectura one-shot como el original (un solo read de 1024 bytes max + filtrado imprimibles)
+                    String chunk = readLegacyBlock(sock, cfg.codePage);
+                    rawAcc.append(chunk);                           // crudo (filtrado como el legado)
+                    fmtAcc.append("[").append(chunk).append("]\n"); // un solo par de corchetes (parser legacy)
 
                     // Archivo encontrado si coincide exactamente con algun acceptedCode
                     if (containsAny(rawAcc.toString(), cfg.acceptedCodes)) {
@@ -548,9 +550,19 @@ public class McBatchSender {
 
                 if (found) {
                     logger.info("*** Generando archivo de respuesta (Reporte)...");
-                    final String dataToWrite = cfg.reportProcess
-                            ? orderDetails(fmtAcc.toString(), acceptedFirst)  // procesado (headers+details), como el original
-                            : rawAcc.toString();                               // crudo (exactamente lo recibido)
+                    String dataToWrite;
+                    if (cfg.reportProcess) {
+                        // Procesado con parser legacy; si falla, fallback a crudo
+                        try {
+                            dataToWrite = orderDetails(fmtAcc.toString(), acceptedFirst);
+                        } catch (Exception ex) {
+                            logger.severe("Ocurrio un error al ordenar el contenido del archivo: " + ex.getMessage());
+                            dataToWrite = rawAcc.toString(); // fallback
+                        }
+                    } else {
+                        dataToWrite = rawAcc.toString(); // crudo
+                    }
+
                     writeDataToFile(date, dataToWrite, effectiveFileName);
                     logger.info("*** Reporte generado: [OK]");
                 } else {
@@ -587,7 +599,7 @@ public class McBatchSender {
             return false;
         }
 
-        /** true si aparece el prefijo (primeros 6) de algun acceptedCode. */
+        /** true si aparece el prefijo (primeros 6) de algun acceptedCode. (No usado en Opcion 2 v2) */
         private static boolean containsAnyAcceptedPrefix(String haystack, List<String> options) {
             if (options == null || options.isEmpty()) return false;
             for (String o : options) {
@@ -883,6 +895,34 @@ public class McBatchSender {
             return new String(ebcdicBytes, ebcdic);
         }
 
+        /**
+         * Lectura one-shot (como el legado InSocket): un solo read() de 1024 bytes, EBCDIC->String,
+         * filtrando solo ASCII imprimible (' '..'~') y salto de linea '\n'.
+         *
+         * @param s socket conectado
+         * @param ebcdic code page EBCDIC
+         * @return bloque decodificado y filtrado; "" si no hubo datos
+         * @throws IOException si falla la lectura
+         */
+        private static String readLegacyBlock(Socket s, Charset ebcdic) throws IOException {
+            InputStream is = s.getInputStream();
+            byte[] buf = new byte[1024];
+            int n = is.read(buf, 0, 1024);
+            if (n <= 0) return "";
+            String decoded = new String(buf, 0, n, ebcdic);
+            StringBuilder out = new StringBuilder(decoded.length());
+            for (int i = 0; i < decoded.length(); i++) {
+                char c = decoded.charAt(i);
+                if (c >= ' ' && c <= '~') {
+                    out.append(c);
+                } else if (c == '\n') {
+                    out.append('\n');
+                }
+                // otros (incl. '\r' y controles) se descartan para calcar el legado
+            }
+            return out.toString();
+        }
+
         // ---------------------- Historico (solo Opcion 1) ----------------------
 
         /**
@@ -972,6 +1012,7 @@ public class McBatchSender {
 
         /**
          * Reordena el bloque recibido como el original: headers + details.
+         * Si algo falla en el parseo, la excepcion se propaga y el llamador decide fallback.
          *
          * @param dataMipDato cadena cruda con corchetes agregados por lectura
          * @param allOkCode   codigo OK final (ej. 9980100)
@@ -1082,69 +1123,3 @@ public class McBatchSender {
         }
     }
 }
-
-# =============================================================================
-# McBatchSender - Parametros de configuracion (resumen breve)
-# Uso: java McBatchSender <OPCION> <seccion> [FILE_NAME]
-#   <OPCION>: 1=envio, 2=reporte
-#   <seccion>: nombre del perfil (MIP, GCO, etc.)
-#   [FILE_NAME]: opcional; si falta, se usa fileNameTemplate (9 chars exactos)
-# =============================================================================
-
-# ------------------------------ Generales ------------------------------------
-# host                IP/DNS del receptor
-# port                Puerto TCP (1..65535)
-# connectTimeoutMs    Tiempo max para conectar (ms)
-# soTimeoutMs         Timeout de lectura (ms)
-# codePage            EBCDIC (Cp037/Cp500/Cp1047)
-# date                AAAAMMDD opcional para plantillas (si falta, hoy)
-# acceptedCode        Lista de codigos OK (coma);
-# alreadySentSubstring Substring que indica "ya enviado" (OK inicial)
-# defaultFailCode     Codigo a registrar ante error
-# fileNameTemplate    Si no se pasa FILE_NAME: literal 9, o RXXXX + {rand}/{ddmm} -> 9 chars
-# nameTemplate        Plantilla del nombre de envio ({file},{julian},{yyyymmdd},{yy},{mm},{dd})
-
-# --------------------------- Opcion 1 (envio) --------------------------------
-# chunkSize           Tamano max por trama (bytes)
-# dataFilePath        Archivo de datos a enviar (relativo a user.dir o absoluto)
-# historyFilePath     Archivo de historico (se crea/actualiza con resultado)
-
-# --------------------------- Opcion 2 (reporte) ------------------------------
-# reportNameTemplate  Base del nombre a consultar
-# report.process      Y=procesa headers+details (legado) | N=guarda crudo del servidor
-
-
-[MIP]
-host=10.238.183.1
-port=6246
-connectTimeoutMs=60000
-soTimeoutMs=60000
-chunkSize=980
-dataFilePath=MIPFILE_DATI
-historyFilePath=MIPFILE_HISTORY_R
-acceptedCode=9980100
-alreadySentSubstring=9288W
-defaultFailCode=9980101
-nameTemplate=00401{file}{julian}
-reportNameTemplate=10101{file}{julian}
-fileNameTemplate=R2780{ddmm}
-report.process=Y
-codePage=Cp037
-
-[GCO]
-host=10.238.183.1
-port=6246
-connectTimeoutMs=60000
-soTimeoutMs=60000
-chunkSize=980
-dataFilePath=GCOFILE_DATI
-historyFilePath=GCOFILE_HISTORY_R
-acceptedCode=9980100
-alreadySentSubstring=9288W
-defaultFailCode=9980101
-nameTemplate=00401{file}{julian}
-reportNameTemplate=10101{file}{julian}
-fileNameTemplate=R1190{ddmm}
-report.process=Y
-codePage=Cp037
-
