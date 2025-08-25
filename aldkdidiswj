@@ -3,94 +3,79 @@
 //
 // Proposito:
 //   Envia un archivo de datos a un hub (ej. Mastercard) por TCP (Opcion 1) y genera reporte
-//   de confirmacion (Opcion 2), fiel al comportamiento del original.
+//   de confirmacion (Opcion 2), manteniendo el comportamiento del original.
 //
 // Protocolo:
 //   - Cada trama: header de 2 bytes (longitud big-endian) + cuerpo en EBCDIC.
-//   - Opcion 1 (envio): cada bloque de datos se envía con prefijo ASCII 'R' y luego se convierte
-//     a EBCDIC. Trailer final: 11 bytes = EBCDIC(acceptedCode de 7 chars) + contador(4B).
+//   - Opcion 1 (envio): cada parte se envia con prefijo ASCII 'R' antes del cuerpo y luego
+//     se convierte a EBCDIC. Trailer final: 11 bytes = EBCDIC(acceptedCode de 7 chars) + contador(4B).
 //
 // Flujo (resumen):
 //   Opcion 1 (Envio):
 //     1) Valida permisos (CWD, dataFile, historico).
 //     2) Lee dataFilePath, parte en chunkSize, determina FILE_NAME (CLI o fileNameTemplate).
 //     3) Arma nombre con nameTemplate y hace handshake (acceptedCode / alreadySentSubstring).
-//     4) Envia tramas y trailer 11B, espera confirmacion final (acceptedCode) y actualiza historico.
+//     4) Envia tramas y trailer 11B, espera confirmacion final (acceptedCode), actualiza historico.
 //   Opcion 2 (Reporte):
 //     1) Valida permisos (CWD con escritura).
 //     2) Determina FILE_NAME (CLI o fileNameTemplate).
 //     3) Arma nombre base desde reportNameTemplate y consulta secuencias 01..99.
-//     4) Si report.process=Y: procesa headers+details; si N: escribe contenido crudo.
-//     5) Genera archivo NNNN-YYYYMMDD-Archivo de Cambio Confirmacion y muestra su nombre.
+//     4) Si report.process=Y: procesa headers+details; si N: escribe el contenido crudo.
+//     5) Genera archivo NNNN-YYYYMMDD-Archivo de Cambio Confirmacion en el CWD.
 //
 // Parametrizacion (INI):
 //   - host, port, connectTimeoutMs, soTimeoutMs, chunkSize
 //   - dataFilePath, historyFilePath
-//   - acceptedCode (lista; uno de 7 chars se usa en trailer)
+//   - acceptedCode (lista separada por comas; uno de 7 chars se usa en trailer)
 //   - alreadySentSubstring, defaultFailCode
-//   - codePage (Cp037/Cp500/Cp1047)
+//   - codePage (Cp037/Cp500/Cp1047), date (YYYYMMDD opcional)
 //   - nameTemplate (p.ej. "00401{file}{julian}")
-//   - fileNameTemplate (literal | {rand} | {ddmm} -> 9 chars exactos)
-//   - reportNameTemplate (p.ej. "10101{file}{julian}")
-//   - report.process=Y|N
+//   - fileNameTemplate (si no pasas FILE_NAME): literal, {rand}, {ddmm} -> 9 chars exactos
+//   - reportNameTemplate (p.ej. "10101{file}{julian}") para Opcion 2
+//   - report.process=Y|N (Y=procesa headers+details; N=escribe crudo)
 //
+// Nota: si pasas DATE por CLI, se usa ese valor y la clave `date` del INI se ignora.
 // Uso:
 //   javac McBatchSender.java
-//   java McBatchSender <OPCION> <YYYYMMDD?> <seccion> [FILE_NAME]  [-Dmcsender.config=/ruta/mcsender.ini]
+//   java McBatchSender <OPCION> <seccion> [DATE] [FILE_NAME]  [-Dmcsender.config=/ruta/mcsender.ini]
 //   - <OPCION>    : 1=Envio, 2=Reporte
-//   - <YYYYMMDD?> : (opcional) fecha. Si se pasa, debe ir como 2do argumento; si no, se usa hoy.
 //   - <seccion>   : nombre de la seccion del INI (ej. MIP, GCO)
-//   - [FILE_NAME] : opcional; prioridad sobre fileNameTemplate; 9 chars exactos
+//   - [DATE]      : opcional; AAAAMMDD. Si se omite, se usa la fecha del dia.
+//   - [FILE_NAME] : opcional; prioridad sobre fileNameTemplate; debe tener 9 chars
 //
 // Codigos de salida:
 //   0=OK | 1=error inesperado | 2=uso invalido | 3=INI no encontrado | 4=INI/argumento invalido
 //=================================================================================================
 
-import java.io.ByteArrayOutputStream;
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.NoSuchFileException;
-import java.io.OutputStream;
-import java.io.PrintStream;
-import java.net.ConnectException;
-import java.net.InetSocketAddress;
-import java.net.Socket;
-import java.net.SocketTimeoutException;
-import java.net.UnknownHostException;
-import java.nio.channels.FileChannel;
+import java.io.*;
+import java.net.*;
 import java.nio.charset.Charset;
 import java.nio.charset.MalformedInputException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.AccessDeniedException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardOpenOption;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
+import java.nio.file.*;
+import java.nio.channels.FileChannel;
+import java.time.*;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Random;
+import java.util.*;
 import java.util.logging.Logger;
 
 public class McBatchSender {
     private static final Logger logger = Logger.getLogger(McBatchSender.class.getName());
 
-    // ---------------------------------------------------------------------------------------------
-    // main: parsea CLI (con fecha opcional como 2do argumento), carga INI y despacha opcion.
-    // ---------------------------------------------------------------------------------------------
+    /**
+     * Punto de entrada.
+     *
+     * Lee la opcion (1 envio / 2 reporte), la seccion INI y la configuracion.
+     * Toma FILE_NAME desde CLI si se provee; si no, lo genera desde fileNameTemplate del INI.
+     * Ejecuta el flujo segun la opcion indicada.
+     *
+     * @param args args[0]=OPCION(1|2), args[1]=seccion INI, args[2]=DATE o FILE_NAME (opcional),
+     *             args[3]=FILE_NAME si args[2] fue DATE.
+     *             Propiedad del sistema: -Dmcsender.config=/ruta/mcsender.ini
+     */
     public static void main(String[] args) {
         if (args.length < 2) {
-            System.err.println("Uso: java McBatchSender <OPCION> <YYYYMMDD?> <seccion> [FILE_NAME]  [-Dmcsender.config=/ruta/mcsender.ini]");
+            System.err.println("Uso: java McBatchSender <OPCION> <seccion> [DATE] [FILE_NAME]  [-Dmcsender.config=/ruta/mcsender.ini]");
             System.exit(2);
         }
 
@@ -100,46 +85,36 @@ public class McBatchSender {
             option = Integer.parseInt(optionStr);
         } catch (NumberFormatException nfe) {
             System.err.println("OPCION debe ser 1 (envio) o 2 (reporte). Valor: '" + optionStr + "'");
-            System.exit(4);
-            return;
+            System.exit(4); return;
         }
         if (option != 1 && option != 2) {
             System.err.println("OPCION invalida. Use 1 (envio) o 2 (reporte).");
             System.exit(4);
         }
 
-        // Soporte de dos formatos:
-        //   - Si args[1] es YYYYMMDD, se toma como fecha y la seccion es args[2].
-        //   - Si NO lo es, seccion = args[1] y se usa fecha de hoy.
-        String cliDateArg = null;
-        String section;
-        String fileNameArg = null;
+        final String section = args[1].trim();
 
-        final String maybeDateOrSection = args[1].trim();
-        if (maybeDateOrSection.matches("\\d{8}")) {
-            cliDateArg = maybeDateOrSection;
-            if (args.length < 3) {
-                System.err.println("Falta <seccion> despues de la fecha (YYYYMMDD).");
-                System.exit(2);
+        // --- NUEVO: deteccion flexible de DATE (YYYYMMDD) y FILE_NAME ---
+        String cliDateParam = null;
+        String fileNameArg = null;
+        if (args.length >= 3) {
+            String third = args[2].trim();
+            if (looksLikeDate(third)) {
+                cliDateParam = third;
+                if (args.length >= 4) fileNameArg = args[3].trim().toUpperCase();
+            } else {
+                fileNameArg = third.toUpperCase();
             }
-            section = args[2].trim();
-            if (args.length >= 4) fileNameArg = args[3].trim().toUpperCase(Locale.ROOT);
-        } else {
-            section = maybeDateOrSection;
-            if (args.length >= 3) fileNameArg = args[2].trim().toUpperCase(Locale.ROOT);
         }
+        // ----------------------------------------------------------------
+
+        final String iniPath = System.getProperty("mcsender.config", "mcsender.ini");
+        final Path ini = Paths.get(iniPath);
 
         if (fileNameArg != null && fileNameArg.length() != 9) {
             System.err.println("FILE_NAME debe tener exactamente 9 caracteres. Valor: '" + fileNameArg + "'");
             System.exit(4);
         }
-        if (cliDateArg != null && !Sender.validateDate(cliDateArg)) {
-            System.err.println("Fecha invalida (YYYYMMDD): '" + cliDateArg + "'");
-            System.exit(4);
-        }
-
-        final String iniPath = System.getProperty("mcsender.config", "mcsender.ini");
-        final Path ini = Paths.get(iniPath);
 
         try {
             IniFile cfgFile = IniFile.load(ini);
@@ -148,18 +123,22 @@ public class McBatchSender {
             logger.info("OPCION: " + option);
             logger.info("Host: " + cfg.host + " (" + cfg.host.length() + ")");
             logger.info("Puerto: " + cfg.port + " (" + String.valueOf(cfg.port).length() + ")");
-            if (cliDateArg != null) logger.info("Fecha (CLI): " + cliDateArg);
             logger.info("nameTemplate: " + cfg.nameTemplate);
             logger.info("acceptedCodes: " + cfg.acceptedCodes);
             logger.info("trailerCode (7 chars): " + cfg.trailerCodeSeven());
             logger.info("reportNameTemplate: " + cfg.reportNameTemplate + " | report.process=" + (cfg.reportProcess ? "Y" : "N"));
+            if (cliDateParam != null) {
+                logger.info("DATE (CLI): " + cliDateParam);
+            } else {
+                logger.info("DATE (CLI): <no provisto> -> se usara fecha del dia");
+            }
             if (fileNameArg != null) {
                 logger.info("FILE_NAME (CLI): " + fileNameArg + " (" + fileNameArg.length() + ")");
             } else {
                 logger.info("FILE_NAME (CLI): <no provisto> -> fileNameTemplate=" + cfg.fileNameTemplate);
             }
 
-            new Sender(cfg, option, fileNameArg, cliDateArg).run();
+            new Sender(cfg, option, fileNameArg, cliDateParam).run();
             System.exit(0);
         } catch (NoSuchFileException e) {
             System.err.println("No se encontro el archivo de configuracion: " + e.getFile());
@@ -173,11 +152,22 @@ public class McBatchSender {
         }
     }
 
-    // -------------------------------- Config ---------------------------------
+    // NUEVO: helper para detectar YYYYMMDD simple (8 digitos)
+    private static boolean looksLikeDate(String s) { return s != null && s.matches("\\d{8}"); }
+
+    // -------------------------------- Config --------------------------------
 
     /**
-     * Configuracion efectiva.
-     * Campos: red, archivos, control, charset, plantillas y flags de reporte.
+     * Configuracion efectiva del proceso.
+     *
+     * Campos:
+     * - Red: host, port, connectTimeoutMs, soTimeoutMs
+     * - Particionado: chunkSize
+     * - Archivos: dataFilePath, historyFilePath
+     * - Control: acceptedCodes, alreadySentSubstring, defaultFailCode
+     * - Codificacion: codePage (EBCDIC), dateOverride
+     * - Plantillas: nameTemplate, fileNameTemplate, reportNameTemplate
+     * - Reporte: reportProcess (Y/N)
      */
     static class Config {
         final String host;
@@ -191,6 +181,7 @@ public class McBatchSender {
         final String alreadySentSubstring;
         final String defaultFailCode;
         final Charset codePage;
+        final String dateOverride;
         final String nameTemplate;
         final String fileNameTemplate;
         final String reportNameTemplate;
@@ -199,7 +190,8 @@ public class McBatchSender {
         private Config(String host, int port, int connectTimeoutMs, int soTimeoutMs, int chunkSize,
                        Path dataFilePath, Path historyFilePath, List<String> acceptedCodes,
                        String alreadySentSubstring, String defaultFailCode,
-                       Charset codePage, String nameTemplate, String fileNameTemplate,
+                       Charset codePage, String dateOverride,
+                       String nameTemplate, String fileNameTemplate,
                        String reportNameTemplate, boolean reportProcess) {
             this.host = host;
             this.port = port;
@@ -212,13 +204,25 @@ public class McBatchSender {
             this.alreadySentSubstring = alreadySentSubstring;
             this.defaultFailCode = defaultFailCode;
             this.codePage = codePage;
+            this.dateOverride = dateOverride;
             this.nameTemplate = nameTemplate;
             this.fileNameTemplate = fileNameTemplate;
             this.reportNameTemplate = reportNameTemplate;
             this.reportProcess = reportProcess;
         }
 
-        /** Carga/valida la seccion del INI. */
+        /**
+         * Carga y valida la seccion del INI.
+         *
+         * Reglas:
+         * - Rutas relativas se resuelven contra user.dir.
+         * - acceptedCode acepta lista separada por comas.
+         * - Debe existir un acceptedCode de 7 chars para el trailer.
+         *
+         * @param ini     INI cargado
+         * @param section Nombre de la seccion
+         * @return Config validada
+         */
         static Config from(IniFile ini, String section) {
             Map<String,String> s = ini.section(section);
             if (s == null) throw new IllegalArgumentException("No existe la seccion ["+section+"].");
@@ -243,6 +247,8 @@ public class McBatchSender {
             try { cp = Charset.forName(codePageName); }
             catch (Exception ex) { throw new IllegalArgumentException("codePage invalido: "+codePageName); }
 
+            String dateOverride = s.get("date");
+
             String nameTemplate = s.getOrDefault("nameTemplate", "00401{file}{julian}");
             String fileNameTemplate = s.get("fileNameTemplate");
 
@@ -264,21 +270,25 @@ public class McBatchSender {
 
             return new Config(host, port, connectTimeout, soTimeout, chunk,
                               dataPath, histPath, acceptedList, already, failDef,
-                              cp, nameTemplate, fileNameTemplate,
+                              cp, dateOverride, nameTemplate, fileNameTemplate,
                               reportNameTemplate, reportProcess);
         }
 
-        // Helpers de parseo ---------------------------------------------------
+        /** Resuelve contra el CWD si la ruta es relativa. */
         private static Path resolveAgainstCwd(String p) {
             Path path = Paths.get(p);
             if (path.isAbsolute()) return path.normalize();
             return Paths.get(System.getProperty("user.dir")).resolve(p).normalize();
         }
+
+        /** Obtiene un valor requerido. */
         private static String req(Map<String,String> m, String key) {
             String v = m.get(key);
             if (v == null || v.trim().isEmpty()) throw new IllegalArgumentException("Falta "+key);
             return v.trim();
         }
+
+        /** Parsea entero con rango. */
         private static int parseInt(String s, int min, int max, String name) {
             try {
                 int v = Integer.parseInt(s.trim());
@@ -288,6 +298,8 @@ public class McBatchSender {
                 throw new IllegalArgumentException(name+" no numerico: "+s);
             }
         }
+
+        /** Convierte "a,b,c" en lista haciendo trim. */
         private static List<String> parseList(String csv) {
             List<String> out = new ArrayList<>();
             if (csv == null) return Collections.emptyList();
@@ -297,14 +309,20 @@ public class McBatchSender {
             }
             return out.isEmpty() ? Collections.emptyList() : Collections.unmodifiableList(out);
         }
+
+        /** Primer acceptedCode o defaultFailCode si vacio. */
         String firstAcceptedCodeOrDefault() {
             return acceptedCodes.isEmpty() ? defaultFailCode : acceptedCodes.get(0);
         }
+
+        /** Devuelve un acceptedCode de 7 chars para trailer. */
         String trailerCodeSeven() {
             String t = pickTrailerCodeSeven(acceptedCodes);
             if (t == null) throw new IllegalArgumentException("acceptedCode debe incluir un valor de 7 caracteres para trailer.");
             return t;
         }
+
+        /** Selecciona el primer codigo de longitud 7. */
         private static String pickTrailerCodeSeven(List<String> codes) {
             if (codes == null) return null;
             for (String c : codes) {
@@ -315,14 +333,25 @@ public class McBatchSender {
         }
     }
 
-    // ----------------------------- INI parser --------------------------------
+    // ----------------------------- INI simple -----------------------------
 
     /**
-     * Parser INI simple (UTF-8). Secciones [x] y pares k=v. Ignora lineas vacias y #/;.
+     * Parser INI minimalista (UTF-8).
+     *
+     * Soporta secciones [x] y pares k=v. Ignora lineas vacias y comentarios (# o ;).
+     * La ultima clave repetida gana.
      */
     static class IniFile {
         private final Map<String, Map<String,String>> data = new LinkedHashMap<>();
         private IniFile() {}
+
+        /**
+         * Carga un archivo INI desde disco.
+         *
+         * @param path Ruta del INI
+         * @return IniFile parseado
+         * @throws IOException si no existe o no es legible
+         */
         static IniFile load(Path path) throws IOException {
             if (!Files.exists(path)) throw new NoSuchFileException(path.toString());
             IniFile f = new IniFile();
@@ -346,25 +375,37 @@ public class McBatchSender {
             }
             return f;
         }
+
+        /** Devuelve el mapa de una seccion o null si no existe. */
         Map<String,String> section(String name) { return data.get(name); }
     }
 
-    // -------------------------------- Sender ---------------------------------
+    // ------------------------------ Sender ------------------------------
 
     /**
      * Orquesta Opcion 1 (envio) y Opcion 2 (reporte).
+     *
+     * - Opcion 1:
+     *   Valida entorno, lee/parte payload, arma nombre, handshake, envia tramas y trailer, historico.
+     * - Opcion 2:
+     *   Valida entorno, arma nombre base de reporte, consulta 01..99, procesa o no segun report.process,
+     *   y genera archivo de confirmacion.
      */
     static class Sender {
         private final Config cfg;
         private final int option;
         private final String fileNameArg;
-        private final String cliDateArg; // YYYYMMDD o null
+        private final String date; // NUEVO: fecha efectiva (CLI u hoy)
 
-        Sender(Config cfg, int option, String fileNameArg, String cliDateArg) {
+        Sender(Config cfg, int option, String fileNameArg, String cliDateParam) {
             this.cfg = cfg;
             this.option = option;
             this.fileNameArg = fileNameArg;
-            this.cliDateArg = cliDateArg;
+            // NUEVO: decidir fecha efectiva (CLI si viene, si no hoy)
+            this.date = (cliDateParam != null && validateDate(cliDateParam))
+                    ? cliDateParam
+                    : LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+            logger.info("Fecha efectiva: " + this.date + (cliDateParam != null ? " (CLI)" : " (hoy)"));
         }
 
         /** Ejecuta la opcion seleccionada. */
@@ -376,7 +417,11 @@ public class McBatchSender {
 
         // --------------------------- Opcion 1: Envio ---------------------------
 
-        /** Flujo de envio: valida, lee/parte, arma nombre, handshake, envia tramas y trailer, historico. */
+        /**
+         * Flujo de envio.
+         * Lee dataFile, parte en chunkSize, arma nombre, handshake, envia tramas + trailer 11B,
+         * espera confirmacion final y registra historico.
+         */
         private void runSend() {
             logger.info("=== OPCION 1: Envio ===");
 
@@ -385,17 +430,16 @@ public class McBatchSender {
             byte[] payload = readPayload(cfg.dataFilePath);
             if (payload.length == 0) {
                 logger.warning("El archivo de datos esta vacio: " + cfg.dataFilePath);
-                createShippingHistory(cfg.defaultFailCode, "<NOFILE>", effectiveDate(cliDateArg), cfg.historyFilePath);
+                createShippingHistory(cfg.defaultFailCode, "<NOFILE>", this.date, cfg.historyFilePath);
                 return;
             }
 
             List<byte[]> parts = split(payload, cfg.chunkSize);
             logger.info("Partes a enviar: " + parts.size() + " (chunkSize=" + cfg.chunkSize + ")");
 
-            String date = effectiveDate(cliDateArg);
             String effectiveFileName = (fileNameArg != null && !fileNameArg.isEmpty())
                     ? fileNameArg
-                    : generateFileNameFromTemplate(cfg.fileNameTemplate, date);
+                    : generateFileNameFromTemplate(cfg.fileNameTemplate, this.date);
 
             if (effectiveFileName == null || effectiveFileName.isEmpty()) {
                 throw new IllegalArgumentException("No hay FILE_NAME: CLI o fileNameTemplate requerido.");
@@ -405,7 +449,7 @@ public class McBatchSender {
             }
             logger.info("FILE_NAME efectivo: " + effectiveFileName);
 
-            String nameToSend = applyNameTemplate(cfg.nameTemplate, effectiveFileName, date);
+            String nameToSend = applyNameTemplate(cfg.nameTemplate, effectiveFileName, this.date);
             logger.info("Nombre a enviar: " + nameToSend);
 
             String finalStatus = cfg.defaultFailCode;
@@ -458,30 +502,28 @@ public class McBatchSender {
             } catch (Exception e) {
                 logger.severe("Error inesperado en envio: " + e.getMessage());
             } finally {
-                createShippingHistory(finalStatus, effectiveFileName, date, cfg.historyFilePath);
+                createShippingHistory(finalStatus, effectiveFileName, this.date, cfg.historyFilePath);
             }
 
             logger.info("=== PROCESO FINALIZADO (OPCION 1) ===");
         }
 
         // --------------------------- Opcion 2: Reporte -------------------------
-
         /**
-         * Flujo de reporte:
-         * - Lee UN solo bloque por secuencia (01..99), como el original (one-shot 1024B filtrando).
-         * - Si report.process=Y, procesa headers+details; si falla, fallback a crudo.
-         * - Si report.process=N, escribe crudo.
-         * - Imprime el nombre del archivo de reporte creado.
+         * Flujo de reporte.
+         * - Lee UN solo bloque por secuencia (01..99), como el original (lectura one-shot 1024B max).
+         * - Si report.process=Y, procesa headers+details con el bloque entre corchetes (parser legacy).
+         * - Si report.process=N, escribe el contenido crudo tal cual llega del servidor.
+         * - Si el parser falla, hace fallback al crudo (manteniendo el comportamiento del legado).
          */
         private void runReport() {
             logger.info("=== OPCION 2: Reporte ===");
 
             validateEnvironmentForReport();
 
-            String date = effectiveDate(cliDateArg);
             String effectiveFileName = (fileNameArg != null && !fileNameArg.isEmpty())
                     ? fileNameArg
-                    : generateFileNameFromTemplate(cfg.fileNameTemplate, date);
+                    : generateFileNameFromTemplate(cfg.fileNameTemplate, this.date);
 
             if (effectiveFileName == null || effectiveFileName.isEmpty()) {
                 throw new IllegalArgumentException("No hay FILE_NAME: CLI o fileNameTemplate requerido.");
@@ -491,12 +533,14 @@ public class McBatchSender {
             }
             logger.info("FILE_NAME efectivo: " + effectiveFileName);
 
-            String nameBase = applyNameTemplate(cfg.reportNameTemplate, effectiveFileName, date);
+            // Nombre base de consulta (desde INI). Equivalente al original "10101{file}{julian}"
+            String nameBase = applyNameTemplate(cfg.reportNameTemplate, effectiveFileName, this.date);
             logger.info("Nombre base de reporte: " + nameBase);
 
             String acceptedFirst = cfg.firstAcceptedCodeOrDefault();
             boolean found = false;
 
+            // Acumuladores: crudo (para escribir tal cual) y con corchetes (para parser legacy)
             StringBuilder rawAcc = new StringBuilder();
             StringBuilder fmtAcc = new StringBuilder();
 
@@ -504,24 +548,26 @@ public class McBatchSender {
                 logger.info("[IP:" + cfg.host + "][PTO:" + cfg.port + "]");
                 sock.connect(new InetSocketAddress(cfg.host, cfg.port), cfg.connectTimeoutMs);
                 sock.setSoTimeout(cfg.soTimeoutMs);
-                logger.info("Estado de conexion con MC: " + sock.isConnected());
+                logger.info("Estado de conexion con el MIP: " + sock.isConnected());
 
+                // Consulta secuencias 01..99. Por CADA una se lee UN solo bloque (one-shot 1024B)
                 for (int i = 1; i <= 99; i++) {
                     String secStr = String.format("%02d", i);
                     String queryName = nameBase + secStr;
 
-                    logger.info("*** Consultando archivo de respuesta a MC: " + queryName);
+                    logger.info("*** Consultando archivo de respuesta al MIP: " + queryName);
                     writeNameFrame(sock, queryName, cfg.codePage);
 
-                    logger.info("*** Respuesta del MC: ");
+                    logger.info("*** Respuesta del MIP: ");
                     rawAcc.setLength(0);
                     fmtAcc.setLength(0);
 
-                    // Lectura one-shot como el legado
+                    // Lectura one-shot como el original (un solo read de 1024 bytes max + filtrado imprimibles)
                     String chunk = readLegacyBlock(sock, cfg.codePage);
-                    rawAcc.append(chunk);
-                    fmtAcc.append("[").append(chunk).append("]\n");
+                    rawAcc.append(chunk);                           // crudo (filtrado como el legado)
+                    fmtAcc.append("[").append(chunk).append("]\n"); // un solo par de corchetes (parser legacy)
 
+                    // Archivo encontrado si coincide exactamente con algun acceptedCode
                     if (containsAny(rawAcc.toString(), cfg.acceptedCodes)) {
                         logger.info("Archivo encontrado [OK]");
                         found = true;
@@ -535,6 +581,7 @@ public class McBatchSender {
                     logger.info("*** Generando archivo de respuesta (Reporte)...");
                     String dataToWrite;
                     if (cfg.reportProcess) {
+                        // Procesado con parser legacy; si falla, fallback a crudo
                         try {
                             dataToWrite = orderDetails(fmtAcc.toString(), acceptedFirst);
                         } catch (Exception ex) {
@@ -542,16 +589,12 @@ public class McBatchSender {
                             dataToWrite = rawAcc.toString(); // fallback
                         }
                     } else {
-                        dataToWrite = rawAcc.toString();
+                        dataToWrite = rawAcc.toString(); // crudo
                     }
 
-                    String reportName = writeDataToFile(date, dataToWrite, effectiveFileName);
-                    if (reportName != null) {
-                        logger.info("Reporte: " + reportName + "[GENERADO]");
-                        logger.info("*** Reporte generado: [OK]");
-                    } else {
-                        logger.severe("No se pudo generar el reporte.");
-                    }
+                    // Escribe el archivo y muestra el nombre en logs
+                    writeDataToFile(this.date, dataToWrite, effectiveFileName);
+                    logger.info("*** Reporte generado: [OK]");
                 } else {
                     logger.severe("*** Respuesta del MIP: Archivo no encontrado [FAIL]");
                 }
@@ -586,7 +629,28 @@ public class McBatchSender {
             return false;
         }
 
-        /** Trailer final (11B): EBCDIC(7) + contador(4B BE). */
+        /** true si aparece el prefijo (primeros 6) de algun acceptedCode. (No usado en Opcion 2 v2) */
+        private static boolean containsAnyAcceptedPrefix(String haystack, List<String> options) {
+            if (options == null || options.isEmpty()) return false;
+            for (String o : options) {
+                String p = o.trim();
+                if (p.isEmpty()) continue;
+                String pref = (p.length() >= 6 ? p.substring(0, 6) : p);
+                if (haystack.contains(pref)) return true;
+            }
+            return false;
+        }
+
+        /**
+         * Trailer final de 11 bytes.
+         *
+         * Cuerpo = EBCDIC(acceptedCode de 7 chars) + contador(4B big-endian).
+         *
+         * @param s            socket conectado
+         * @param count        numero total de tramas de datos + 1
+         * @param ebcdic       code page EBCDIC
+         * @param trailerCode7 codigo de 7 caracteres (desde acceptedCode)
+         */
         private static void writeTrailerFrame(Socket s, int count, Charset ebcdic, String trailerCode7) throws IOException {
             if (trailerCode7 == null || trailerCode7.length() != 7) {
                 throw new IllegalArgumentException("El codigo de trailer debe tener 7 caracteres.");
@@ -599,7 +663,15 @@ public class McBatchSender {
             writeFrameRaw(s, body);
         }
 
-        /** FILE_NAME desde template: literal (9), {rand}=4 digitos, {ddmm}=dia+mes. */
+        /**
+         * Genera FILE_NAME desde fileNameTemplate (case-insensitive).
+         *
+         * Reglas: literal (9), {rand}=4 digitos, {ddmm}=dia+mes.
+         *
+         * @param template  plantilla del INI
+         * @param yyyymmdd  fecha efectiva YYYYMMDD
+         * @return nombre de 9 caracteres
+         */
         private static String generateFileNameFromTemplate(String template, String yyyymmdd) {
             if (template == null || template.trim().isEmpty()) {
                 throw new IllegalArgumentException("fileNameTemplate no definido en el INI.");
@@ -609,18 +681,30 @@ public class McBatchSender {
             String ddmm = String.format("%02d%02d", d.getDayOfMonth(), d.getMonthValue());
 
             base = base.replaceAll("(?i)\\{ddmm\\}", ddmm);
+
             if (base.matches("(?i).*\\{rand\\}.*")) {
                 String rand4 = String.format("%04d", new Random().nextInt(10000));
                 base = base.replaceAll("(?i)\\{rand\\}", rand4);
             }
+
             base = base.toUpperCase(Locale.ROOT);
+
             if (base.length() != 9) {
                 throw new IllegalArgumentException("fileNameTemplate debe producir 9 caracteres. Obtenido '" + base + "' (" + base.length() + ")");
             }
             return base;
         }
 
-        /** Aplica plantilla: {file},{julian},{yyyymmdd},{yy},{mm},{dd} (case-insensitive). */
+        /**
+         * Aplica plantilla de nombre.
+         *
+         * Tokens: {file}, {julian}, {yyyymmdd}, {yy}, {mm}, {dd} (case-insensitive).
+         *
+         * @param template plantilla a aplicar
+         * @param fileName nombre logico (9 chars)
+         * @param yyyymmdd fecha efectiva
+         * @return nombre final
+         */
         private static String applyNameTemplate(String template, String fileName, String yyyymmdd) {
             LocalDate d = LocalDate.parse(yyyymmdd, DateTimeFormatter.BASIC_ISO_DATE);
             String julian = String.format("%03d", d.getDayOfYear());
@@ -629,39 +713,161 @@ public class McBatchSender {
             String dd = String.format("%02d", d.getDayOfMonth());
 
             String out = template;
-            out = out.replaceAll("(?i)\\{file\\}", java.util.regex.Matcher.quoteReplacement(fileName));
-            out = out.replaceAll("(?i)\\{julian\\}", julian);
+            out = out.replaceAll("(?i)\\{file\\}",     java.util.regex.Matcher.quoteReplacement(fileName));
+            out = out.replaceAll("(?i)\\{julian\\}",   julian);
             out = out.replaceAll("(?i)\\{yyyymmdd\\}", yyyymmdd);
-            out = out.replaceAll("(?i)\\{yy\\}", yy);
-            out = out.replaceAll("(?i)\\{mm\\}", mm);
-            out = out.replaceAll("(?i)\\{dd\\}", dd);
+            out = out.replaceAll("(?i)\\{yy\\}",       yy);
+            out = out.replaceAll("(?i)\\{mm\\}",       mm);
+            out = out.replaceAll("(?i)\\{dd\\}",       dd);
             return out;
         }
 
-        /** Fecha efectiva YYYYMMDD (toma CLI si viene; si no, hoy). */
-        private static String effectiveDate(String cliDate) {
-            if (cliDate != null && validateDate(cliDate)) return cliDate;
-            return LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE);
-        }
+        /**
+         * Valida permisos para envio.
+         *
+         * Requiere: CWD legible/ejecutable, dataFile legible, dir del historico escribible/ejecutable.
+         */
+        private static void validateEnvironmentForSend(Config cfg) {
+            File cwd = new File(System.getProperty("user.dir"));
+            logDirPerms("Directorio actual", cwd);
+            if (!cwd.canRead() || !cwd.canExecute()) {
+                throw new IllegalStateException("El directorio actual no tiene permisos suficientes (lectura y ejecucion).");
+            }
 
-        /** Valida AAAAMMDD. */
-        static boolean validateDate(String date) {
-            try {
-                DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyyMMdd");
-                LocalDate.parse(date, formatter);
-                return true;
-            } catch (Exception e) {
-                return false;
+            File dataFile = cfg.dataFilePath.toFile();
+            if (!dataFile.exists() || !dataFile.isFile()) {
+                throw new IllegalStateException("No existe el archivo de datos o no es regular: " + cfg.dataFilePath);
+            }
+            logger.info("Permisos del archivo de datos (" + dataFile.getName() + "):");
+            logger.info("Lectura: " + (dataFile.canRead() ? "Permitido" : "No permitido"));
+            logger.info("Escritura: " + (dataFile.canWrite() ? "Permitido" : "No permitido"));
+            if (!dataFile.canRead()) {
+                throw new IllegalStateException("No hay permisos de lectura sobre el archivo de datos: " + dataFile.getAbsolutePath());
+            }
+
+            File histFile = cfg.historyFilePath.toFile();
+            File histDir  = histFile.getAbsoluteFile().getParentFile();
+            if (histDir != null) {
+                logDirPerms("Directorio del historico", histDir);
+                if (!histDir.canWrite() || !histDir.canExecute()) {
+                    throw new IllegalStateException("El directorio del historico no permite escribir/ejecutar: " + histDir.getAbsolutePath());
+                }
+            }
+
+            try (FileChannel ignore = FileChannel.open(cfg.historyFilePath,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
+                // OK
+            } catch (IOException e) {
+                throw new IllegalStateException("No se puede crear/escribir en el historico: " + cfg.historyFilePath + " - " + e.getMessage(), e);
             }
         }
 
-        /** Envia trama de nombre (texto->EBCDIC) con header(2B). */
+        /**
+         * Valida permisos para reporte.
+         *
+         * Requiere: CWD legible/ejecutable/escribible para crear el archivo de reporte.
+         */
+        private static void validateEnvironmentForReport() {
+            File cwd = new File(System.getProperty("user.dir"));
+            logDirPerms("Directorio actual", cwd);
+            if (!cwd.canRead() || !cwd.canExecute() || !cwd.canWrite()) {
+                throw new IllegalStateException("El directorio actual no tiene permisos suficientes (lectura/ejecucion/escritura) para generar el reporte.");
+            }
+        }
+
+        /** Log de permisos de un directorio. */
+        private static void logDirPerms(String label, File dir) {
+            logger.info(label + " (" + dir.getAbsolutePath() + "):");
+            logger.info("Lectura: " + (dir.canRead() ? "Permitido" : "No permitido"));
+            logger.info("Escritura: " + (dir.canWrite() ? "Permitido" : "No permitido"));
+            logger.info("Ejecucion: " + (dir.canExecute() ? "Permitido" : "No permitido"));
+        }
+
+        /**
+         * Lee bytes del archivo de datos.
+         *
+         * @param p ruta del archivo de entrada
+         * @return bytes del payload
+         */
+        private static byte[] readPayload(Path p) {
+            logger.info("Leyendo payload: " + p.toAbsolutePath());
+            try {
+                byte[] data = Files.readAllBytes(p);
+                logger.info("Tamano payload: " + data.length + " bytes");
+                return data;
+            } catch (AccessDeniedException e) {
+                throw new RuntimeException("Sin permisos para leer: " + p, e);
+            } catch (NoSuchFileException e) {
+                throw new RuntimeException("No existe el archivo: " + p, e);
+            } catch (IOException e) {
+                throw new RuntimeException("Error leyendo archivo: " + p + " - " + e.getMessage(), e);
+            }
+        }
+
+        /**
+         * Parte bytes en trozos de tamano fijo.
+         *
+         * @param data bytes de entrada
+         * @param chunkSize tamano maximo por parte
+         * @return lista de partes (cada una <= chunkSize)
+         */
+        private static List<byte[]> split(byte[] data, int chunkSize) {
+            List<byte[]> parts = new ArrayList<>();
+            int total = data.length;
+            for (int off = 0; off < total; off += chunkSize) {
+                int len = Math.min(chunkSize, total - off);
+                parts.add(Arrays.copyOfRange(data, off, off + len));
+            }
+            return parts;
+        }
+
+        /**
+         * Codifica entero sin signo en big-endian usando N bytes.
+         *
+         * @param num valor
+         * @param byts cantidad de bytes
+         * @return arreglo big-endian
+         */
+        private static byte[] lengthToBytes(int num, int byts) {
+            byte[] r = new byte[byts];
+            for (int i = byts - 1; i >= 0; --i) {
+                r[i] = (byte)(num & 0xFF);
+                num >>>= 8;
+            }
+            return r;
+        }
+
+        /**
+         * Devuelve fecha efectiva YYYYMMDD (override desde INI o fecha del sistema).
+         *
+         * @param cfg configuracion
+         * @return AAAAMMDD
+         */
+        private static String effectiveDate(Config cfg) {
+            return (cfg.dateOverride != null && !cfg.dateOverride.isEmpty())
+                    ? cfg.dateOverride
+                    : LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+        }
+
+        /**
+         * Escribe trama de nombre (texto -> EBCDIC) con header de 2 bytes.
+         *
+         * @param s socket
+         * @param text cuerpo textual
+         * @param ebcdic code page
+         */
         private static void writeNameFrame(Socket s, String text, Charset ebcdic) throws IOException {
             byte[] body = text.getBytes(ebcdic);
             writeFrameRaw(s, body);
         }
 
-        /** Envia trama de datos con prefijo 'R' (ASCII), luego EBCDIC y header(2B). */
+        /**
+         * Escribe trama de datos con prefijo 'R' (ASCII), luego convierte a EBCDIC y envia.
+         *
+         * @param s socket
+         * @param asciiChunk bloque ASCII sin prefijo
+         * @param ebcdic code page
+         */
         private static void writeChunkFrame(Socket s, byte[] asciiChunk, Charset ebcdic) throws IOException {
             ByteArrayOutputStream baos = new ByteArrayOutputStream(1 + asciiChunk.length);
             baos.write((byte) 'R');
@@ -671,7 +877,12 @@ public class McBatchSender {
             writeFrameRaw(s, body);
         }
 
-        /** Escribe header(2B) + body en socket (flush). */
+        /**
+         * Escribe header(2B) + body en el socket y hace flush.
+         *
+         * @param s socket
+         * @param body cuerpo sin header
+         */
         private static void writeFrameRaw(Socket s, byte[] body) throws IOException {
             int len = body.length;
             byte[] header = lengthToBytes(len, 2);
@@ -681,7 +892,19 @@ public class McBatchSender {
             os.flush();
         }
 
-        /** Lee respuesta acumulativa (EBCDIC->String) hasta lectura corta o timeout con datos. */
+        /**
+         * Lee respuesta del servidor hasta lectura corta o timeout.
+         * Decodifica desde EBCDIC a String.
+         *
+         * Corta si:
+         * - read() retorna -1 (fin)
+         * - la ultima lectura < tamano de buffer
+         * - timeout: si ya hay datos, devuelve; si no, relanza
+         *
+         * @param s socket
+         * @param ebcdic code page
+         * @return texto decodificado
+         */
         private static String readResponse(Socket s, Charset ebcdic) throws IOException {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             InputStream is = s.getInputStream();
@@ -702,7 +925,15 @@ public class McBatchSender {
             return new String(ebcdicBytes, ebcdic);
         }
 
-        /** Lectura one-shot (como InSocket legacy): un read(1024), EBCDIC->String, filtrando imprimibles. */
+        /**
+         * Lectura one-shot (como el legado InSocket): un solo read() de 1024 bytes, EBCDIC->String,
+         * filtrando solo ASCII imprimible (' '..'~') y salto de linea '\n'.
+         *
+         * @param s socket conectado
+         * @param ebcdic code page EBCDIC
+         * @return bloque decodificado y filtrado; "" si no hubo datos
+         * @throws IOException si falla la lectura
+         */
         private static String readLegacyBlock(Socket s, Charset ebcdic) throws IOException {
             InputStream is = s.getInputStream();
             byte[] buf = new byte[1024];
@@ -717,13 +948,21 @@ public class McBatchSender {
                 } else if (c == '\n') {
                     out.append('\n');
                 }
+                // otros (incl. '\r' y controles) se descartan para calcar el legado
             }
             return out.toString();
         }
 
         // ---------------------- Historico (solo Opcion 1) ----------------------
 
-        /** Agrega registro al historico (prepend) y rota en dia 1. */
+        /**
+         * Agrega un registro al historico (prepend) y rota mensualmente si corresponde.
+         *
+         * @param respCode codigo final (acceptedCode o defaultFailCode)
+         * @param fileName nombre logico (9 chars)
+         * @param dateYYYYMMDD fecha efectiva
+         * @param historyPath ruta del historico
+         */
         private static void createShippingHistory(String respCode, String fileName, String dateYYYYMMDD, Path historyPath) {
             try {
                 monthlyRotateIfFirstDay(historyPath);
@@ -734,6 +973,8 @@ public class McBatchSender {
                 logger.severe("No se pudo actualizar el historico: " + e.getMessage());
             }
         }
+
+        /** Si es dia 1, trunca/crea historico. */
         private static void monthlyRotateIfFirstDay(Path historyPath) {
             if (LocalDate.now().getDayOfMonth() == 1) {
                 try {
@@ -744,10 +985,19 @@ public class McBatchSender {
                 }
             }
         }
+
+        /** Formatea linea de historico. */
         private static String formatHistory(String resp, String code, String fec, LocalDateTime now) {
             String ts = now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
             return "[" + resp + "-" + code + "-" + fec + ": " + ts + "]";
         }
+
+        /**
+         * Inserta una linea al inicio del archivo (prepend).
+         *
+         * @param path ruta del archivo
+         * @param line contenido a insertar
+         */
         private static void prependLine(Path path, String line) throws IOException {
             List<String> lines = new ArrayList<>();
             if (Files.exists(path)) {
@@ -765,36 +1015,57 @@ public class McBatchSender {
         // ------------------ Helpers de reporte (Opcion 2) ---------------------
 
         /**
-         * Escribe el archivo de reporte en el CWD y devuelve su nombre.
+         * Genera y escribe el archivo de reporte en el CWD.
+         *
+         * @param dateYYYYMMDD fecha AAAAMMDD
+         * @param data contenido a escribir (procesado o crudo)
+         * @param fileName9 FILE_NAME (9 chars) para prefijo del nombre
          */
-        private static String writeDataToFile(String dateYYYYMMDD, String data, String fileName9) throws IOException {
+        private static void writeDataToFile(String dateYYYYMMDD, String data, String fileName9) throws IOException {
             logger.info("Parametro date: " + dateYYYYMMDD + " (" + dateYYYYMMDD.length() + ")");
             if (!validateDate(dateYYYYMMDD)) {
                 logger.severe("Fecha ingresada no es valida: " + dateYYYYMMDD);
-                return null;
+                return;
             }
             final String newName = getNameFileReport(dateYYYYMMDD, fileName9);
             logger.info("Generacion de nombre de reporte es valido: " + (newName != null));
             if (newName == null) {
                 logger.severe("Nombre de reporte no pudo generarse.");
-                return null;
+                return;
             }
             logger.info("Creando reporte...");
             try (FileOutputStream reportFile = new FileOutputStream(newName);
                  PrintStream ps = new PrintStream(reportFile, true, "UTF-8")) {
                 ps.print(data);
             }
-            return newName;
+            // NUEVO: mostrar el nombre del archivo generado
+            logger.info("Reporte: " + newName + "[GENERADO]");
         }
 
-        /** Ordena headers + detalles (parser legacy). */
+        /**
+         * Reordena el bloque recibido como el original: headers + details.
+         * Si algo falla en el parseo, la excepcion se propaga y el llamador decide fallback.
+         *
+         * @param dataMipDato cadena cruda con corchetes agregados por lectura
+         * @param allOkCode   codigo OK final (ej. 9980100)
+         * @return cadena con headers y detalles formateados
+         */
         private static String orderDetails(String dataMipDato, String allOkCode) {
             String headers = extractHeaders(dataMipDato);
             String details = extractDetails(dataMipDato, allOkCode);
             return headers + details;
         }
 
-        /** Extrae cabeceras desde el bloque recibido (reglas legacy). */
+        /**
+         * Extrae cabeceras desde el bloque recibido.
+         *
+         * Regla:
+         * - Encabezado corto: primeros 20 chars (sin '>') + "]\n"
+         * - Cabecera: desde "12" hasta antes del primer "16" (si existe), o hasta el cierre de ']' siguiente.
+         *
+         * @param data bloque con corchetes
+         * @return cabecera formateada
+         */
         private static String extractHeaders(String data) {
             String header = data.replace(">", "").substring(0, 20) + "]\n";
             int firstIndexDetail = data.indexOf("16");
@@ -807,7 +1078,19 @@ public class McBatchSender {
             return header + headerInfo;
         }
 
-        /** Extrae detalles respetando anchos fijos (reglas legacy). */
+        /**
+         * Extrae detalles desde el bloque recibido, respetando anchos fijos.
+         *
+         * Reglas (como original):
+         * - Partir desde primer "16"; dividir por "D0".
+         * - Campos: prefijo "16", segmento [0..57), zona de errores desde 57 con ancho 26,
+         *   y longitudes intermedias de 83 para items no finales.
+         * - En el ultimo item, cerrar en allOkCode.
+         *
+         * @param data bloque con corchetes
+         * @param allOkCode codigo OK final
+         * @return detalles formateados
+         */
         private static String extractDetails(String data, String allOkCode) {
             int firstIndexDetail = data.indexOf("16");
             StringBuilder detail = new StringBuilder();
@@ -839,7 +1122,24 @@ public class McBatchSender {
             return detail.toString();
         }
 
-        /** Nombre de archivo de reporte: NNNN-YYYYMMDD-Archivo de Cambio Confirmacion */
+        /** Valida fecha AAAAMMDD. */
+        private static boolean validateDate(String date) {
+            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyyMMdd");
+            try {
+                LocalDate.parse(date, formatter);
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        /**
+         * Nombre de archivo de reporte: NNNN-YYYYMMDD-Archivo de Cambio Confirmacion
+         *
+         * @param dateYYYYMMDD fecha AAAAMMDD
+         * @param fileName9 FILE_NAME (9 chars)
+         * @return nombre del archivo o null si la fecha es invalida
+         */
         private static String getNameFileReport(String dateYYYYMMDD, String fileName9) {
             final String description = "-Archivo de Cambio Confirmacion";
             DateTimeFormatter inputFormatter = DateTimeFormatter.ofPattern("yyyyMMdd");
@@ -853,95 +1153,7 @@ public class McBatchSender {
                 return null;
             }
         }
-
-        // --------------------- IO/Permisos/Bytes utilities --------------------
-
-        /** Log de permisos de un directorio. */
-        private static void logDirPerms(String label, File dir) {
-            logger.info(label + " (" + dir.getAbsolutePath() + "):");
-            logger.info("Lectura: " + (dir.canRead() ? "Permitido" : "No permitido"));
-            logger.info("Escritura: " + (dir.canWrite() ? "Permitido" : "No permitido"));
-            logger.info("Ejecucion: " + (dir.canExecute() ? "Permitido" : "No permitido"));
-        }
-
-        /** Valida permisos requeridos para envio. */
-        private static void validateEnvironmentForSend(Config cfg) {
-            File cwd = new File(System.getProperty("user.dir"));
-            logDirPerms("Directorio actual", cwd);
-            if (!cwd.canRead() || !cwd.canExecute()) {
-                throw new IllegalStateException("El directorio actual no tiene permisos suficientes (lectura y ejecucion).");
-            }
-            File dataFile = cfg.dataFilePath.toFile();
-            if (!dataFile.exists() || !dataFile.isFile()) {
-                throw new IllegalStateException("No existe el archivo de datos o no es regular: " + cfg.dataFilePath);
-            }
-            logger.info("Permisos del archivo de datos (" + dataFile.getName() + "):");
-            logger.info("Lectura: " + (dataFile.canRead() ? "Permitido" : "No permitido"));
-            logger.info("Escritura: " + (dataFile.canWrite() ? "Permitido" : "No permitido"));
-            if (!dataFile.canRead()) {
-                throw new IllegalStateException("No hay permisos de lectura sobre el archivo de datos: " + dataFile.getAbsolutePath());
-            }
-            File histFile = cfg.historyFilePath.toFile();
-            File histDir  = histFile.getAbsoluteFile().getParentFile();
-            if (histDir != null) {
-                logDirPerms("Directorio del historico", histDir);
-                if (!histDir.canWrite() || !histDir.canExecute()) {
-                    throw new IllegalStateException("El directorio del historico no permite escribir/ejecutar: " + histDir.getAbsolutePath());
-                }
-            }
-            try (FileChannel ignore = FileChannel.open(cfg.historyFilePath,
-                    StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
-                // OK
-            } catch (IOException e) {
-                throw new IllegalStateException("No se puede crear/escribir en el historico: " + cfg.historyFilePath + " - " + e.getMessage(), e);
-            }
-        }
-
-        /** Valida permisos para reporte (necesita escribir en CWD). */
-        private static void validateEnvironmentForReport() {
-            File cwd = new File(System.getProperty("user.dir"));
-            logDirPerms("Directorio actual", cwd);
-            if (!cwd.canRead() || !cwd.canExecute() || !cwd.canWrite()) {
-                throw new IllegalStateException("El directorio actual no tiene permisos suficientes (lectura/ejecucion/escritura) para generar el reporte.");
-            }
-        }
-
-        /** Lee el payload desde disco. */
-        private static byte[] readPayload(Path p) {
-            logger.info("Leyendo payload: " + p.toAbsolutePath());
-            try {
-                byte[] data = Files.readAllBytes(p);
-                logger.info("Tamano payload: " + data.length + " bytes");
-                return data;
-            } catch (AccessDeniedException e) {
-                throw new RuntimeException("Sin permisos para leer: " + p, e);
-            } catch (NoSuchFileException e) {
-                throw new RuntimeException("No existe el archivo: " + p, e);
-            } catch (IOException e) {
-                throw new RuntimeException("Error leyendo archivo: " + p + " - " + e.getMessage(), e);
-            }
-        }
-
-        /** Parte bytes en trozos de tamaño fijo. */
-        private static List<byte[]> split(byte[] data, int chunkSize) {
-            List<byte[]> parts = new ArrayList<>();
-            int total = data.length;
-            for (int off = 0; off < total; off += chunkSize) {
-                int len = Math.min(chunkSize, total - off);
-                parts.add(Arrays.copyOfRange(data, off, off + len));
-            }
-            return parts;
-        }
-
-        /** Entero sin signo a big-endian usando N bytes. */
-        private static byte[] lengthToBytes(int num, int byts) {
-            byte[] r = new byte[byts];
-            for (int i = byts - 1; i >= 0; --i) {
-                r[i] = (byte)(num & 0xFF);
-                num >>>= 8;
-            }
-            return r;
-        }
     }
 }
+
 
