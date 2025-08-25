@@ -37,7 +37,7 @@
 // Nota: si pasas DATE por CLI, se usa ese valor y la clave `date` del INI se ignora.
 // Uso:
 //   javac McBatchSender.java
-//   java McBatchSender <OPCION> <seccion> [DATE] [FILE_NAME]  [-Dmcsender.config=/ruta/mcsender.ini]
+//   java McBatchSender <OPCION> <seccion> [FILE_NAME] [DATE]
 //   - <OPCION>    : 1=Envio, 2=Reporte
 //   - <seccion>   : nombre de la seccion del INI (ej. MIP, GCO)
 //   - [DATE]      : opcional; AAAAMMDD. Si se omite, se usa la fecha del dia.
@@ -94,19 +94,40 @@ public class McBatchSender {
 
         final String section = args[1].trim();
 
-        // --- NUEVO: deteccion flexible de DATE (YYYYMMDD) y FILE_NAME ---
+        // --- PARSEO CLI ---
+        // Formatos soportados (prioridad al nuevo orden):
+        //   1) <OPCION> <seccion> <FILE_NAME> <DATE>
+        //   2) <OPCION> <seccion> <FILE_NAME>
+        //   3) <OPCION> <seccion> <DATE>
+        //   4) <OPCION> <seccion> <DATE> <FILE_NAME>
         String cliDateParam = null;
         String fileNameArg = null;
+
         if (args.length >= 3) {
-            String third = args[2].trim();
-            if (looksLikeDate(third)) {
-                cliDateParam = third;
-                if (args.length >= 4) fileNameArg = args[3].trim().toUpperCase();
-            } else {
+            String third  = args[2].trim();
+            String fourth = (args.length >= 4 ? args[3].trim() : null);
+
+            // Preferimos el nuevo orden: tercero = FILE_NAME(9), cuarto = DATE(8)
+            if (third.length() == 9 && !looksLikeDate(third)) {
+                // 9 chars (pueden ser o no dígitos) -> FILE_NAME
                 fileNameArg = third.toUpperCase();
+                if (fourth != null && looksLikeDate(fourth)) cliDateParam = fourth;
+            } else if (third.length() == 9) {
+                // También aceptar 9 dígitos como FILE_NAME
+                fileNameArg = third.toUpperCase();
+                if (fourth != null && looksLikeDate(fourth)) cliDateParam = fourth;
+            } else if (looksLikeDate(third)) {
+                // Retrocompatibilidad: tercero = DATE
+                cliDateParam = third;
+                if (fourth != null && fourth.length() == 9) fileNameArg = fourth.toUpperCase();
+            } else {
+                // Si no es ni DATE ni 9 chars, lo asumimos como FILE_NAME y validamos abajo
+                fileNameArg = third.toUpperCase();
+                if (fourth != null && looksLikeDate(fourth)) cliDateParam = fourth;
             }
         }
         // ----------------------------------------------------------------
+
 
         final String iniPath = System.getProperty("mcsender.config", "mcsender.ini");
         final Path ini = Paths.get(iniPath);
@@ -1155,5 +1176,3 @@ public class McBatchSender {
         }
     }
 }
-
-
