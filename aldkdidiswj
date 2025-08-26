@@ -561,9 +561,9 @@ public class McBatchSender {
             String acceptedFirst = cfg.firstAcceptedCodeOrDefault();
             boolean found = false;
 
-            // Acumuladores: crudo (para escribir tal cual) y con corchetes (para parser legacy)
-            StringBuilder rawAcc = new StringBuilder();
-            StringBuilder fmtAcc = new StringBuilder();
+            // guardaremos aquí el intento que matcheó
+            String foundChunk = null;
+            String foundHeaderLine = null;
 
             try (Socket sock = new Socket()) {
                 logger.info("[IP:" + cfg.host + "][PTO:" + cfg.port + "]");
@@ -571,27 +571,28 @@ public class McBatchSender {
                 sock.setSoTimeout(cfg.soTimeoutMs);
                 logger.info("Estado de conexion con el MIP: " + sock.isConnected());
 
+                // base de envío para el encabezado legacy: 00401{file}{julian}
+                final String sendBase = applyNameTemplate(cfg.nameTemplate, effectiveFileName, this.date);
+
                 // Consulta secuencias 01..99. Por CADA una se lee UN solo bloque (one-shot 1024B)
                 for (int i = 1; i <= 99; i++) {
                     String secStr = String.format("%02d", i);
-                    String queryName = nameBase + secStr;
+                    String queryName = nameBase + secStr; // 10101{file}{julian}{seq}
 
                     logger.info("*** Consultando archivo de respuesta al MIP: " + queryName);
                     writeNameFrame(sock, queryName, cfg.codePage);
 
                     logger.info("*** Respuesta del MIP: ");
-                    rawAcc.setLength(0);
-                    fmtAcc.setLength(0);
+                    String chunk = readLegacyBlock(sock, cfg.codePage);  // lectura one-shot como el original
 
-                    // Lectura one-shot como el original (un solo read de 1024 bytes max + filtrado imprimibles)
-                    String chunk = readLegacyBlock(sock, cfg.codePage);
-                    rawAcc.append(chunk);                           // crudo (filtrado como el legado)
-                    fmtAcc.append("[").append(chunk).append("]\n"); // un solo par de corchetes (parser legacy)
-
-                    // Archivo encontrado si coincide exactamente con algun acceptedCode
-                    if (containsAny(rawAcc.toString(), cfg.acceptedCodes)) {
+                    // ¿match exacto/substring con algún acceptedCode?
+                    if (containsAny(chunk, cfg.acceptedCodes)) {
                         logger.info("Archivo encontrado [OK]");
                         found = true;
+
+                        // Encabezado EXACTO que debe ir entre corchetes: 00401{file}{julian}{seq}
+                        foundHeaderLine = "[" + sendBase + secStr + "]\n";
+                        foundChunk = chunk;
                         break;
                     } else {
                         logger.info("Buscando...");
@@ -604,13 +605,13 @@ public class McBatchSender {
                     if (cfg.reportProcess) {
                         // Procesado con parser legacy; si falla, fallback a crudo
                         try {
-                            dataToWrite = orderDetails(fmtAcc.toString(), acceptedFirst);
+                            dataToWrite = orderDetails(foundHeaderLine + foundChunk, acceptedFirst);
                         } catch (Exception ex) {
                             logger.severe("Ocurrio un error al ordenar el contenido del archivo: " + ex.getMessage());
-                            dataToWrite = rawAcc.toString(); // fallback
+                            dataToWrite = foundChunk; // fallback
                         }
                     } else {
-                        dataToWrite = rawAcc.toString(); // crudo
+                        dataToWrite = foundChunk; // crudo
                     }
 
                     // Escribe el archivo y muestra el nombre en logs
