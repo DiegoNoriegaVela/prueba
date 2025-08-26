@@ -534,8 +534,8 @@ public class McBatchSender {
          * Flujo de reporte.
          * - Lee UN solo bloque por secuencia (01..99), como el original (lectura one-shot 1024B max).
          * - Si report.process=Y, procesa headers+details con el bloque entre corchetes (parser legacy).
-         * - Si report.process=N, escribe el contenido crudo pero SIEMPRE prefijado con el encabezado [...].
-         * - Si el parser falla, hace fallback al crudo + encabezado (manteniendo el comportamiento del legado).
+         * - Si report.process=N, escribe el contenido crudo tal cual llega del servidor.
+         * - Si el parser falla, hace fallback al crudo (manteniendo el comportamiento del legado).
          */
         private void runReport() {
             logger.info("=== OPCION 2: Reporte ===");
@@ -557,14 +557,14 @@ public class McBatchSender {
             // Nombre base de consulta (desde INI). Equivalente al original "10101{file}{julian}"
             String nameBase = applyNameTemplate(cfg.reportNameTemplate, effectiveFileName, this.date);
             logger.info("Nombre base de reporte: " + nameBase);
-
-            // Base para el encabezado legacy "[00401{file}{julian}{seq}]"
             final String sendBase = applyNameTemplate(cfg.nameTemplate, effectiveFileName, this.date);
-            final String acceptedFirst = cfg.firstAcceptedCodeOrDefault();
 
+            String acceptedFirst = cfg.firstAcceptedCodeOrDefault();
             boolean found = false;
-            String foundChunk = null;
-            String foundHeaderLine = null;
+
+            // Acumuladores: crudo (para escribir tal cual) y con corchetes (para parser legacy)
+            StringBuilder rawAcc = new StringBuilder();
+            StringBuilder fmtAcc = new StringBuilder();
 
             try (Socket sock = new Socket()) {
                 logger.info("[IP:" + cfg.host + "][PTO:" + cfg.port + "]");
@@ -575,20 +575,25 @@ public class McBatchSender {
                 // Consulta secuencias 01..99. Por CADA una se lee UN solo bloque (one-shot 1024B)
                 for (int i = 1; i <= 99; i++) {
                     String secStr = String.format("%02d", i);
-                    String queryName = nameBase + secStr; // 10101{file}{julian}{seq}
+                    String queryName = nameBase + secStr;
 
                     logger.info("*** Consultando archivo de respuesta al MIP: " + queryName);
                     writeNameFrame(sock, queryName, cfg.codePage);
 
                     logger.info("*** Respuesta del MIP: ");
-                    String chunk = readLegacyBlock(sock, cfg.codePage);  // lectura one-shot como el original
+                    rawAcc.setLength(0);
+                    fmtAcc.setLength(0);
 
-                    // ¿match (exacto o substring) con algun acceptedCode?
-                    if (containsAny(chunk, cfg.acceptedCodes)) {
+                    // Lectura one-shot como el original (un solo read de 1024 bytes max + filtrado imprimibles)
+                    String chunk = readLegacyBlock(sock, cfg.codePage);
+                    rawAcc.append(chunk);                           // crudo (filtrado como el legado)
+                    String headerLine = "[" + sendBase + secStr + "]\n";
+                    fmtAcc.append(headerLine).append(chunk);
+
+                    // Archivo encontrado si coincide exactamente con algun acceptedCode
+                    if (containsAny(rawAcc.toString(), cfg.acceptedCodes)) {
                         logger.info("Archivo encontrado [OK]");
                         found = true;
-                        foundHeaderLine = "[" + sendBase + secStr + "]\n";  // ENCABEZADO EXACTO
-                        foundChunk = chunk;
                         break;
                     } else {
                         logger.info("Buscando...");
@@ -598,18 +603,16 @@ public class McBatchSender {
                 if (found) {
                     logger.info("*** Generando archivo de respuesta (Reporte)...");
                     String dataToWrite;
-
                     if (cfg.reportProcess) {
-                        // Procesado con parser legacy; si falla, fallback a crudo + encabezado
+                        // Procesado con parser legacy; si falla, fallback a crudo
                         try {
-                            dataToWrite = orderDetails(foundHeaderLine + foundChunk, acceptedFirst);
+                            dataToWrite = orderDetails(fmtAcc.toString(), acceptedFirst);
                         } catch (Exception ex) {
                             logger.severe("Ocurrio un error al ordenar el contenido del archivo: " + ex.getMessage());
-                            dataToWrite = foundHeaderLine + foundChunk; // fallback conservando el encabezado
+                            dataToWrite = rawAcc.toString(); // fallback
                         }
                     } else {
-                        // Modo crudo, pero conservando SIEMPRE el encabezado como en el legado visual
-                        dataToWrite = foundHeaderLine + foundChunk;
+                        dataToWrite = rawAcc.toString(); // crudo
                     }
 
                     // Escribe el archivo y muestra el nombre en logs
