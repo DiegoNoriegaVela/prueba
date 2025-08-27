@@ -1150,17 +1150,9 @@ public class McBatchSender {
         /**
          * Extrae detalles desde el bloque recibido, respetando anchos fijos.
          *
-         * Diferencia clave: las líneas de detalle se imprimen con prefijo **D0**
-         * (no "16"), que es lo que necesitas en la salida final.
-         *
-         * Reglas (como original):
-         * - Partir desde primer "16"; si no hay, desde "D0".
-         * - Dividir por "D0".
-         * - Para cada item:
-         *   - Prefijar "D0" y salto de línea entre items.
-         *   - Campos: segmento [0..57), zona de errores desde 57 con ancho 26,
-         *     y longitudes intermedias de 83 para items no finales.
-         *   - En el último item, cerrar en allOkCode si aparece, o aplicar 83 chars como fallback.
+         * NOTA: Se añade un salto de línea ANTES del primer registro para que
+         * la línea de detalle "D0..." comience en una NUEVA línea, incluso si
+         * los headers no terminaron con '\n'.
          */
         private static String extractDetails(String data, String allOkCode) {
             String src = (data == null) ? "" : data;
@@ -1175,13 +1167,20 @@ public class McBatchSender {
 
             // Separar por D0 (delimitador de registros de detalle)
             String[] detailsData = cleaned.split("D0", -1);
-            StringBuilder out = new StringBuilder();
 
+            StringBuilder out = new StringBuilder();
+            // Asegurar que el primer D0 va en una NUEVA línea respecto a los headers
+            out.append('\n');
+
+            boolean first = true;
             for (int i = 1; i < detailsData.length; i++) {
                 String seg = detailsData[i];
 
-                // Separador entre registros y prefijo D0 (requerido)
-                if (out.length() > 0) out.append('\n');
+                // Para el primer item ya metimos el salto; para los siguientes, agrega uno
+                if (!first) out.append('\n');
+                first = false;
+
+                // Prefijo requerido
                 out.append("D0");
 
                 // Partes fijas
@@ -1211,10 +1210,8 @@ public class McBatchSender {
                 out.append(seg, 0, Math.min(83, seg.length()));
             }
 
-            // Ya imprimimos "D0" explícitamente por línea; no hace falta el replace("D0","\nD0")
             return out.toString();
         }
-
 
         /** Valida fecha AAAAMMDD. */
         private static boolean validateDate(String date) {
@@ -1270,4 +1267,5 @@ public class McBatchSender {
         }
     }
 }
+
 
