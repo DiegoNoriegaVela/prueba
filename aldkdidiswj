@@ -619,6 +619,14 @@ public class McBatchSender {
                     if (cfg.reportProcess) {
                         // Procesa con parser legacy; si falla, fallback al crudo (N)
                         try {
+                            // DEBUG — ensure we have the exact shape the legacy expects
+                            String fmt = finalFmt.toString();
+                            String sansGt = fmt.replace(">", "");
+                            int take = Math.min(20, sansGt.length());
+                            logger.info("DBG fmt startsWith '[': " + fmt.startsWith("[") + ", len=" + fmt.length());
+                            logger.info("DBG first20(after removing '>'): [" + sansGt.substring(0, take) + "]");
+                            logger.info("DBG first64(raw, \\n shown): " + fmt.replace("\n","\\n").substring(0, Math.min(64, fmt.length())));
+
                             dataToWrite = orderDetails(finalFmt.toString(), acceptedFirst);
                         } catch (Exception ex) {
                             logger.severe("Ocurrio un error al ordenar el contenido del archivo: " + ex.getMessage());
