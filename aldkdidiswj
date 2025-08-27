@@ -557,7 +557,6 @@ public class McBatchSender {
             // Nombre base de consulta (desde INI). Equivalente al original "10101{file}{julian}"
             String nameBase = applyNameTemplate(cfg.reportNameTemplate, effectiveFileName, this.date);
             logger.info("Nombre base de reporte: " + nameBase);
-            final String sendBase = applyNameTemplate(cfg.nameTemplate, effectiveFileName, this.date);
 
             String acceptedFirst = cfg.firstAcceptedCodeOrDefault();
             boolean found = false;
@@ -585,10 +584,10 @@ public class McBatchSender {
                     fmtAcc.setLength(0);
 
                     // Lectura one-shot como el original (un solo read de 1024 bytes max + filtrado imprimibles)
-                    String chunk = readLegacyBlock(sock, cfg.codePage);
+                    //String chunk = readLegacyBlock(sock, cfg.codePage);
+                    String chunk = readLegacyBlockExact(sock);
                     rawAcc.append(chunk);                           // crudo (filtrado como el legado)
-                    String headerLine = "[" + sendBase + secStr + "]\n";
-                    fmtAcc.append(headerLine).append(chunk);
+                    fmtAcc.append("[").append(chunk).append("]\n"); // un solo par de corchetes (parser legacy)
 
                     // Archivo encontrado si coincide exactamente con algun acceptedCode
                     if (containsAny(rawAcc.toString(), cfg.acceptedCodes)) {
@@ -948,30 +947,56 @@ public class McBatchSender {
             return new String(ebcdicBytes, ebcdic);
         }
 
+        // --- Traducción legacy exacta (CP037) como translateByte original -----------------
+        private static final int[] ASCII_PRINTABLE = {
+            32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,
+            48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,
+            64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,
+            80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,
+            96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,
+            112,113,114,115,116,117,118,119,120,121,122,123,124,125,126
+        };
+        // CP037: mismos pares que usa el legado (espacio..~). Decimales EBCDIC.
+        private static final int[] EBCDIC_CP037 = {
+            64,90,127,123,91,108,80,125,77,93,92,78,107,96,75,97,
+            240,241,242,243,244,245,246,247,248,249,122,94,76,126,110,111,
+            124,193,194,195,196,197,198,199,200,201,209,210,211,212,213,214,
+            215,216,217,226,227,228,229,230,231,232,233,173,224,189,176,109,
+            121,129,130,131,132,133,134,135,136,137,145,146,147,148,149,150,
+            151,152,153,162,163,164,165,166,167,168,169,192,79,208,161
+        };
+
+        // Tabla directa EBCDIC->ASCII (lo no mapeado queda -1)
+        private static final int[] E2A = new int[256];
+        static {
+            Arrays.fill(E2A, -1);
+            for (int i = 0; i < ASCII_PRINTABLE.length; i++) {
+                E2A[EBCDIC_CP037[i] & 0xFF] = ASCII_PRINTABLE[i];
+            }
+        }
+
+        /** Traduce UN byte EBCDIC CP037 a ASCII como el translateByte original. */
+        private static char legacyE2A(final int eb) {
+            int v = eb & 0xFF;
+            int m = E2A[v];
+            // Si no está en la tabla, el legado devolvía el mismo valor sin traducir.
+            return (char) (m >= 0 ? m : v);
+        }
+
         /**
-         * Lectura one-shot (como el legado InSocket): un solo read() de 1024 bytes, EBCDIC->String,
-         * filtrando solo ASCII imprimible (' '..'~') y salto de linea '\n'.
-         *
-         * @param s socket conectado
-         * @param ebcdic code page EBCDIC
-         * @return bloque decodificado y filtrado; "" si no hubo datos
-         * @throws IOException si falla la lectura
+         * Lectura "one-shot" de hasta 1024B y traducción byte-a-byte con la tabla legacy.
+         * Sólo conserva ASCII imprimible (' '..'~') y '\n', igual que InSocket.
          */
-        private static String readLegacyBlock(Socket s, Charset ebcdic) throws IOException {
-            InputStream is = s.getInputStream();
-            byte[] buf = new byte[1024];
-            int n = is.read(buf, 0, 1024);
+        private static String readLegacyBlockExact(final Socket s) throws IOException {
+            final byte[] buf = new byte[1024];
+            int n = s.getInputStream().read(buf, 0, 1024);
             if (n <= 0) return "";
-            String decoded = new String(buf, 0, n, ebcdic);
-            StringBuilder out = new StringBuilder(decoded.length());
-            for (int i = 0; i < decoded.length(); i++) {
-                char c = decoded.charAt(i);
-                if (c >= ' ' && c <= '~') {
-                    out.append(c);
-                } else if (c == '\n') {
-                    out.append('\n');
-                }
-                // otros (incl. '\r' y controles) se descartan para calcar el legado
+            StringBuilder out = new StringBuilder(n);
+            for (int i = 0; i < n; i++) {
+                char c = legacyE2A(buf[i]);
+                if (c >= ' ' && c <= '~') out.append(c);
+                else if (c == '\n') out.append('\n');
+                // cualquier otro control se descarta (igual que el original)
             }
             return out.toString();
         }
@@ -1178,4 +1203,3 @@ public class McBatchSender {
         }
     }
 }
-
