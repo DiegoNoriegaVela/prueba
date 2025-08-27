@@ -529,13 +529,16 @@ public class McBatchSender {
             logger.info("=== PROCESO FINALIZADO (OPCION 1) ===");
         }
 
-        // --------------------------- Opcion 2: Reporte -------------------------
+       // --------------------------- Opcion 2: Reporte -------------------------
         /**
-         * Flujo de reporte.
-         * - Lee UN solo bloque por secuencia (01..99), como el original (lectura one-shot 1024B max).
-         * - Si report.process=Y, procesa headers+details con el bloque entre corchetes (parser legacy).
-         * - Si report.process=N, escribe el contenido crudo tal cual llega del servidor.
-         * - Si el parser falla, hace fallback al crudo (manteniendo el comportamiento del legado).
+         * Flujo de reporte (comportamiento calcado del original GCO_MIP):
+         * - Para cada secuencia 01..99, se envia el nombre y se leen uno o varios
+         *   bloques "legacy" (un read de 1024B por bloque, filtrando imprimibles),
+         *   envolviendo cada bloque entre corchetes: "[" + chunk + "]\n".
+         * - Se deja de leer cuando aparece el PREFIJO de un acceptedCode (p.ej. "998010").
+         * - Se considera encontrado cuando aparece un acceptedCode COMPLETO (p.ej. "9980100").
+         * - Si report.process=Y: se procesa headers+details con el bloque entre corchetes;
+         *   si falla el parser, fallback a crudo. Si report.process=N: se escribe crudo.
          */
         private void runReport() {
             logger.info("=== OPCION 2: Reporte ===");
@@ -554,16 +557,16 @@ public class McBatchSender {
             }
             logger.info("FILE_NAME efectivo: " + effectiveFileName);
 
-            // Nombre base de consulta (desde INI). Equivalente al original "10101{file}{julian}"
+            // Nombre base de consulta (ej. "10101{file}{julian}")
             String nameBase = applyNameTemplate(cfg.reportNameTemplate, effectiveFileName, this.date);
             logger.info("Nombre base de reporte: " + nameBase);
 
-            String acceptedFirst = cfg.firstAcceptedCodeOrDefault();
+            final String acceptedFirst = cfg.firstAcceptedCodeOrDefault();
             boolean found = false;
 
-            // Acumuladores: crudo (para escribir tal cual) y con corchetes (para parser legacy)
-            StringBuilder rawAcc = new StringBuilder();
-            StringBuilder fmtAcc = new StringBuilder();
+            // Acumuladores finales (se llenan solo cuando "found")
+            StringBuilder finalRaw = new StringBuilder();
+            StringBuilder finalFmt = new StringBuilder();
 
             try (Socket sock = new Socket()) {
                 logger.info("[IP:" + cfg.host + "][PTO:" + cfg.port + "]");
@@ -571,28 +574,40 @@ public class McBatchSender {
                 sock.setSoTimeout(cfg.soTimeoutMs);
                 logger.info("Estado de conexion con el MIP: " + sock.isConnected());
 
-                // Consulta secuencias 01..99. Por CADA una se lee UN solo bloque (one-shot 1024B)
+                // Consulta secuencias 01..99 (como el original)
                 for (int i = 1; i <= 99; i++) {
-                    String secStr = String.format("%02d", i);
+                    String secStr   = String.format("%02d", i);
                     String queryName = nameBase + secStr;
 
                     logger.info("*** Consultando archivo de respuesta al MIP: " + queryName);
                     writeNameFrame(sock, queryName, cfg.codePage);
 
-                    logger.info("*** Respuesta del MIP: ");
-                    rawAcc.setLength(0);
-                    fmtAcc.setLength(0);
+                    // === LECTURA MÚLTIPLE AL ESTILO ORIGINAL ===
+                    // rpt2 = "[" + InSocket() + "]\n" ... hasta ver "998010" (prefijo OK)
+                    StringBuilder rawAcc = new StringBuilder(); // sin corchetes (para N)
+                    StringBuilder fmtAcc = new StringBuilder(); // con corchetes (para Y)
 
-                    // Lectura one-shot como el original (un solo read de 1024 bytes max + filtrado imprimibles)
-                    String chunk = readLegacyBlock(sock, cfg.codePage);
-                    rawAcc.append(chunk);                           // crudo (filtrado como el legado)
-                    fmtAcc.append("[").append(chunk).append("]\n"); // un solo par de corchetes (parser legacy)
+                    boolean moreData = true;
+                    while (moreData) {
+                        String chunk = readLegacyBlock(sock, cfg.codePage); // un solo read(1024) + filtro imprimibles
+                        fmtAcc.append('[').append(chunk).append("]\n");
+                        rawAcc.append(chunk);
 
-                    // Archivo encontrado si coincide exactamente con algun acceptedCode
+                        // Corta cuando aparece el PREFIJO de algún acceptedCode (p.ej. "998010")
+                        if (chunk.isEmpty() || containsAnyAcceptedPrefix(fmtAcc.toString(), cfg.acceptedCodes)) {
+                            moreData = false;
+                        }
+                    }
+
+                    // Archivo encontrado si el contenido incluye algún acceptedCode COMPLETO
                     if (containsAny(rawAcc.toString(), cfg.acceptedCodes)) {
                         logger.info("Archivo encontrado [OK]");
                         found = true;
-                        break;
+                        finalRaw.setLength(0);
+                        finalFmt.setLength(0);
+                        finalRaw.append(rawAcc);
+                        finalFmt.append(fmtAcc);
+                        break; // dejamos de iterar 01..99
                     } else {
                         logger.info("Buscando...");
                     }
@@ -602,18 +617,19 @@ public class McBatchSender {
                     logger.info("*** Generando archivo de respuesta (Reporte)...");
                     String dataToWrite;
                     if (cfg.reportProcess) {
-                        // Procesado con parser legacy; si falla, fallback a crudo
+                        // Procesa con parser legacy; si falla, fallback al crudo (N)
                         try {
-                            dataToWrite = orderDetails(fmtAcc.toString(), acceptedFirst);
+                            dataToWrite = orderDetails(finalFmt.toString(), acceptedFirst);
                         } catch (Exception ex) {
                             logger.severe("Ocurrio un error al ordenar el contenido del archivo: " + ex.getMessage());
-                            dataToWrite = rawAcc.toString(); // fallback
+                            dataToWrite = finalRaw.toString(); // Fallback a N
                         }
                     } else {
-                        dataToWrite = rawAcc.toString(); // crudo
+                        // N: escribir crudo tal cual llega del servidor (SIN corchetes)
+                        dataToWrite = finalRaw.toString();
                     }
 
-                    // Escribe el archivo y muestra el nombre en logs
+                    // Escribir archivo con nombre NNNN-YYYYMMDD-Archivo de Cambio Confirmacion
                     writeDataToFile(this.date, dataToWrite, effectiveFileName);
                     logger.info("*** Reporte generado: [OK]");
                 } else {
@@ -633,6 +649,7 @@ public class McBatchSender {
 
             logger.info("=== PROCESO FINALIZADO (OPCION 2) ===");
         }
+
 
         // ----------------------------- Utilidades -----------------------------
 
@@ -927,16 +944,24 @@ public class McBatchSender {
          * @return texto decodificado
          */
         private static String readResponse(Socket s, Charset ebcdic) throws IOException {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
             InputStream is = s.getInputStream();
-            int b1 = is.read(), b2 = is.read();
-            if (b1 < 0 || b2 < 0) throw new EOFException("Missing 2-byte header");
-            int len = ((b1 & 0xFF) << 8) | (b2 & 0xFF);
-            byte[] body = is.readNBytes(len);
-            if (body.length != len) throw new EOFException("Short body: " + body.length + "/" + len);
-            return new String(body, ebcdic);
+            byte[] buf = new byte[1024];
+            int n;
+            while (true) {
+                try {
+                    n = is.read(buf);
+                    if (n == -1) break;
+                    baos.write(buf, 0, n);
+                    if (n < buf.length) break;
+                } catch (SocketTimeoutException te) {
+                    if (baos.size() == 0) throw te;
+                    break;
+                }
+            }
+            byte[] ebcdicBytes = baos.toByteArray();
+            return new String(ebcdicBytes, ebcdic);
         }
-
-        
 
         /**
          * Lectura one-shot (como el legado InSocket): un solo read() de 1024 bytes, EBCDIC->String,
