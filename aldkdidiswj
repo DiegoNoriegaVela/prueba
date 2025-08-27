@@ -119,7 +119,7 @@ public class McBatchSender {
             } else if (looksLikeDate(third)) {
                 // Retrocompatibilidad: tercero = DATE
                 cliDateParam = third;
-                if (fourth != null && fourth.length() == 9) fileNameArg = fourth.toUpperCase();
+                if (forthcomingNonNull(fourth) && fourth.length() == 9) fileNameArg = fourth.toUpperCase();
             } else {
                 // Si no es ni DATE ni 9 chars, lo asumimos como FILE_NAME y validamos abajo
                 fileNameArg = third.toUpperCase();
@@ -175,6 +175,7 @@ public class McBatchSender {
 
     // NUEVO: helper para detectar YYYYMMDD simple (8 digitos)
     private static boolean looksLikeDate(String s) { return s != null && s.matches("\\d{8}"); }
+    private static boolean forthcomingNonNull(String s) { return s != null && !s.isEmpty(); }
 
     // -------------------------------- Config --------------------------------
 
@@ -529,16 +530,21 @@ public class McBatchSender {
             logger.info("=== PROCESO FINALIZADO (OPCION 1) ===");
         }
 
-       // --------------------------- Opcion 2: Reporte -------------------------
+        // --------------------------- Opcion 2: Reporte -------------------------
         /**
-         * Flujo de reporte (comportamiento calcado del original GCO_MIP):
-         * - Para cada secuencia 01..99, se envia el nombre y se leen uno o varios
-         *   bloques "legacy" (un read de 1024B por bloque, filtrando imprimibles),
-         *   envolviendo cada bloque entre corchetes: "[" + chunk + "]\n".
-         * - Se deja de leer cuando aparece el PREFIJO de un acceptedCode (p.ej. "998010").
-         * - Se considera encontrado cuando aparece un acceptedCode COMPLETO (p.ej. "9980100").
-         * - Si report.process=Y: se procesa headers+details con el bloque entre corchetes;
-         *   si falla el parser, fallback a crudo. Si report.process=N: se escribe crudo.
+         * Flujo de reporte.
+         * - Lee UN solo bloque por secuencia (01..99), como el original (lectura one-shot 1024B max).
+         * - Si report.process=Y, procesa headers+details con el bloque entre corchetes (parser legacy).
+         * - Si report.process=N, escribe el contenido crudo tal cual llega del servidor.
+         * - Si el parser falla, hace fallback al crudo (manteniendo el comportamiento del legado).
+         *
+         * *** ACTUALIZADO: Comportamiento calcado del código original (GCO_MIP) ***
+         * Para cada secuencia:
+         *   - Enviar nombre; leer múltiples bloques "legacy" en formato: '[' + chunk + "]\n"
+         *   - Cortar cuando aparezca el PREFIJO de algún acceptedCode (p.ej. "998010")
+         *   - Considerar "encontrado" cuando aparezca algún acceptedCode COMPLETO (p.ej. "9980100")
+         *   - report.process = Y -> procesar con parser robusto; si falla -> fallback a crudo
+         *   - report.process = N -> escribir crudo sin corchetes
          */
         private void runReport() {
             logger.info("=== OPCION 2: Reporte ===");
@@ -557,11 +563,11 @@ public class McBatchSender {
             }
             logger.info("FILE_NAME efectivo: " + effectiveFileName);
 
-            // Nombre base de consulta (ej. "10101{file}{julian}")
+            // Nombre base de consulta (desde INI). Equivalente al original "10101{file}{julian}"
             String nameBase = applyNameTemplate(cfg.reportNameTemplate, effectiveFileName, this.date);
             logger.info("Nombre base de reporte: " + nameBase);
 
-            final String acceptedFirst = cfg.firstAcceptedCodeOrDefault();
+            String acceptedFirst = cfg.firstAcceptedCodeOrDefault();
             boolean found = false;
 
             // Acumuladores finales (se llenan solo cuando "found")
@@ -576,15 +582,14 @@ public class McBatchSender {
 
                 // Consulta secuencias 01..99 (como el original)
                 for (int i = 1; i <= 99; i++) {
-                    String secStr   = String.format("%02d", i);
+                    String secStr = String.format("%02d", i);
                     String queryName = nameBase + secStr;
 
                     logger.info("*** Consultando archivo de respuesta al MIP: " + queryName);
                     writeNameFrame(sock, queryName, cfg.codePage);
 
                     // === LECTURA MÚLTIPLE AL ESTILO ORIGINAL ===
-                    // rpt2 = "[" + InSocket() + "]\n" ... hasta ver "998010" (prefijo OK)
-                    StringBuilder rawAcc = new StringBuilder(); // sin corchetes (para N)
+                    StringBuilder rawAcc = new StringBuilder(); // crudo SIN corchetes (para N)
                     StringBuilder fmtAcc = new StringBuilder(); // con corchetes (para Y)
 
                     boolean moreData = true;
@@ -593,7 +598,15 @@ public class McBatchSender {
                         fmtAcc.append('[').append(chunk).append("]\n");
                         rawAcc.append(chunk);
 
-                        // Corta cuando aparece el PREFIJO de algún acceptedCode (p.ej. "998010")
+                        // DEBUG opcional (tal como el que mostraste)
+                        String fmt = fmtAcc.toString();
+                        String sansGt = fmt.replace(">", "");
+                        int take = Math.min(20, sansGt.length());
+                        logger.info("DBG fmt startsWith '[': " + fmt.startsWith("[") + ", len=" + fmt.length());
+                        logger.info("DBG first20(after removing '>'): [" + sansGt.substring(0, take) + "]");
+                        logger.info("DBG first64(raw, \\n shown): " + fmt.replace("\n","\\n").substring(0, Math.min(64, fmt.length())));
+
+                        // Cortar cuando aparece el PREFIJO de un acceptedCode (p.ej. "998010")
                         if (chunk.isEmpty() || containsAnyAcceptedPrefix(fmtAcc.toString(), cfg.acceptedCodes)) {
                             moreData = false;
                         }
@@ -617,27 +630,19 @@ public class McBatchSender {
                     logger.info("*** Generando archivo de respuesta (Reporte)...");
                     String dataToWrite;
                     if (cfg.reportProcess) {
-                        // Procesa con parser legacy; si falla, fallback al crudo (N)
+                        // Procesado con parser legacy robusto; si falla, fallback a crudo
                         try {
-                            // DEBUG — ensure we have the exact shape the legacy expects
-                            String fmt = finalFmt.toString();
-                            String sansGt = fmt.replace(">", "");
-                            int take = Math.min(20, sansGt.length());
-                            logger.info("DBG fmt startsWith '[': " + fmt.startsWith("[") + ", len=" + fmt.length());
-                            logger.info("DBG first20(after removing '>'): [" + sansGt.substring(0, take) + "]");
-                            logger.info("DBG first64(raw, \\n shown): " + fmt.replace("\n","\\n").substring(0, Math.min(64, fmt.length())));
-
                             dataToWrite = orderDetails(finalFmt.toString(), acceptedFirst);
                         } catch (Exception ex) {
                             logger.severe("Ocurrio un error al ordenar el contenido del archivo: " + ex.getMessage());
-                            dataToWrite = finalRaw.toString(); // Fallback a N
+                            dataToWrite = finalRaw.toString(); // fallback
                         }
                     } else {
-                        // N: escribir crudo tal cual llega del servidor (SIN corchetes)
+                        // N: escribir crudo tal cual (SIN corchetes)
                         dataToWrite = finalRaw.toString();
                     }
 
-                    // Escribir archivo con nombre NNNN-YYYYMMDD-Archivo de Cambio Confirmacion
+                    // Escribe el archivo y muestra el nombre en logs
                     writeDataToFile(this.date, dataToWrite, effectiveFileName);
                     logger.info("*** Reporte generado: [OK]");
                 } else {
@@ -657,7 +662,6 @@ public class McBatchSender {
 
             logger.info("=== PROCESO FINALIZADO (OPCION 2) ===");
         }
-
 
         // ----------------------------- Utilidades -----------------------------
 
@@ -1097,8 +1101,11 @@ public class McBatchSender {
          * @return cadena con headers y detalles formateados
          */
         private static String orderDetails(String dataMipDato, String allOkCode) {
-            String headers = extractHeaders(dataMipDato);
-            String details = extractDetails(dataMipDato, allOkCode);
+            // Normaliza artefacto 'T' al inicio de linea antes de 'H' ("]\nTH..." -> "]\nH...")
+            String fixed = normalizeTHArtifact(dataMipDato);
+
+            String headers = extractHeaders(fixed);
+            String details = extractDetails(fixed, allOkCode);
             return headers + details;
         }
 
@@ -1107,65 +1114,93 @@ public class McBatchSender {
          *
          * Regla:
          * - Encabezado corto: primeros 20 chars (sin '>') + "]\n"
-         * - Cabecera: desde "12" hasta antes del primer "16" (si existe), o hasta el cierre de ']' siguiente.
+         * - Cabecera: desde "12" (legacy) o "H0" (formato nuevo) hasta antes del primer "16" o "D0".
+         *   Si no hay "16"/"D0", hasta el ']' siguiente o fin.
          *
          * @param data bloque con corchetes
          * @return cabecera formateada
          */
         private static String extractHeaders(String data) {
-            String header = data.replace(">", "").substring(0, 20) + "]\n";
-            int firstIndexDetail = data.indexOf("16");
-            String headerInfo;
-            if (firstIndexDetail != -1) {
-                headerInfo = data.substring(data.indexOf("12"), firstIndexDetail);
-            } else {
-                headerInfo = data.substring(data.indexOf("12"), data.indexOf("]", data.indexOf("12")));
-            }
-            return header + headerInfo;
+            String src = (data == null) ? "" : data;
+
+            // Encabezado corto (20) y corchete cierre como el legado
+            String sansGt  = src.replace(">", "");
+            String first20 = sansGt.length() >= 20 ? sansGt.substring(0, 20)
+                                                   : String.format("%-20s", sansGt);
+            String header = first20 + "]\n";
+
+            // Inicios posibles: "12" (legacy) o "H0" (formato con H/D0)
+            int start12 = src.indexOf("12");
+            int startH  = src.indexOf("H0");
+            int start   = (start12 >= 0) ? start12 : (startH >= 0 ? startH : -1);
+
+            if (start < 0) return header; // no hay header info reconocible
+
+            // Fines posibles: "16" (legacy) o "D0" (H/D0) o el primer ']' o fin
+            int end16   = src.indexOf("16", start);
+            int endD0   = src.indexOf("D0", start);
+            int endBrkt = src.indexOf("]",  start);
+
+            int end = firstNonNegMin(end16, endD0, endBrkt);
+            if (end < 0) end = src.length();
+
+            return header + safeSub(src, start, end);
         }
 
         /**
          * Extrae detalles desde el bloque recibido, respetando anchos fijos.
          *
          * Reglas (como original):
-         * - Partir desde primer "16"; dividir por "D0".
+         * - Partir desde primer "16"; si no hay, desde "D0".
+         * - Dividir por "D0".
          * - Campos: prefijo "16", segmento [0..57), zona de errores desde 57 con ancho 26,
          *   y longitudes intermedias de 83 para items no finales.
-         * - En el ultimo item, cerrar en allOkCode.
+         * - En el ultimo item, cerrar en allOkCode si aparece, o aplicar la misma regla que el legado.
          *
          * @param data bloque con corchetes
          * @param allOkCode codigo OK final
          * @return detalles formateados
          */
         private static String extractDetails(String data, String allOkCode) {
-            int firstIndexDetail = data.indexOf("16");
+            String src = (data == null) ? "" : data;
+
+            int start16 = src.indexOf("16");
+            int startD0 = src.indexOf("D0");
+            int start   = (start16 >= 0) ? start16 : (startD0 >= 0 ? startD0 : -1);
             StringBuilder detail = new StringBuilder();
-            if (firstIndexDetail != -1) {
-                String[] detailsData = data.substring(firstIndexDetail).replace("[", "").replace("]\n", "").split("D0");
-                for (int i = 1; i < detailsData.length; i++) {
-                    detail.append("16");
-                    if (detailsData[i].substring(57).length() < 26) {
-                        String codErrors = String.format("%26s", detailsData[i].substring(57).trim().substring(0, 15));
-                        detail.append(detailsData[i].substring(0, 57)).append(codErrors);
-                        continue;
-                    }
-                    if (i == detailsData.length - 1) {
-                        if (detailsData[i].substring(57).length() < 26) {
-                            String codErrors = String.format("%26s", detailsData[i].substring(57).trim().substring(0, 15));
-                            detail.append(detailsData[i].substring(0, 57)).append(codErrors).append(allOkCode);
+            if (start < 0) return "";
+
+            String cleaned = safeSub(src, start, src.length()).replace("[","").replace("]\n","");
+
+            String[] detailsData = cleaned.split("D0", -1);
+            for (int i = 1; i < detailsData.length; i++) {
+                String seg = detailsData[i];
+                detail.append("16");
+
+                String head = seg.length() >= 57 ? seg.substring(0,57) : String.format("%-57s", seg);
+                String tail = seg.length()  > 57 ? seg.substring(57)   : "";
+
+                if (i == detailsData.length - 1) {
+                    if (tail.length() < 26) {
+                        String t = tail.trim();
+                        if (t.length() > 15) t = t.substring(0, 15);
+                        String codErrors = String.format("%26s", t);
+                        detail.append(head).append(codErrors).append(allOkCode);
+                    } else {
+                        int okPos = seg.indexOf(allOkCode);
+                        if (okPos >= 0) {
+                            detail.append(seg, 0, okPos + allOkCode.length());
                         } else {
-                            int codresp = detailsData[i].indexOf(allOkCode);
-                            if (codresp != -1) {
-                                detail.append(detailsData[i].substring(0, codresp + allOkCode.length()));
-                            }
+                            detail.append(seg, 0, Math.min(83, seg.length()));
                         }
-                        break;
                     }
-                    detail.append(detailsData[i].substring(0, 83));
+                    break;
                 }
-                return detail.toString().replace("D0", "\nD0");
+
+                detail.append(seg, 0, Math.min(83, seg.length()));
             }
-            return detail.toString();
+
+            return detail.toString().replace("D0", "\nD0");
         }
 
         /** Valida fecha AAAAMMDD. */
@@ -1199,6 +1234,30 @@ public class McBatchSender {
                 return null;
             }
         }
+
+        // -------------------- Helpers NUEVOS para robustez --------------------
+
+        /** Quita un 'T' al inicio de línea justo antes de 'H' (caso visto: "]\nTH000..." -> "]\nH000..."). */
+        private static String normalizeTHArtifact(String s) {
+            if (s == null) return "";
+            return s.replaceAll("(?m)^T(?=H)", "");
+        }
+
+        /** substring seguro (evita OOB). */
+        private static String safeSub(String s, int from, int to) {
+            if (s == null) return "";
+            int a = Math.max(0, Math.min(from, s.length()));
+            int b = Math.max(a, Math.min(to,   s.length()));
+            return s.substring(a, b);
+        }
+
+        /** mínimo entre índices >=0; retorna -1 si ninguno es válido. */
+        private static int firstNonNegMin(int... idx) {
+            int best = -1;
+            for (int v : idx) if (v >= 0 && (best < 0 || v < best)) best = v;
+            return best;
+        }
     }
 }
+
 
