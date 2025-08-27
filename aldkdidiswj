@@ -1150,16 +1150,17 @@ public class McBatchSender {
         /**
          * Extrae detalles desde el bloque recibido, respetando anchos fijos.
          *
+         * Diferencia clave: las líneas de detalle se imprimen con prefijo **D0**
+         * (no "16"), que es lo que necesitas en la salida final.
+         *
          * Reglas (como original):
          * - Partir desde primer "16"; si no hay, desde "D0".
          * - Dividir por "D0".
-         * - Campos: prefijo "16", segmento [0..57), zona de errores desde 57 con ancho 26,
-         *   y longitudes intermedias de 83 para items no finales.
-         * - En el ultimo item, cerrar en allOkCode si aparece, o aplicar la misma regla que el legado.
-         *
-         * @param data bloque con corchetes
-         * @param allOkCode codigo OK final
-         * @return detalles formateados
+         * - Para cada item:
+         *   - Prefijar "D0" y salto de línea entre items.
+         *   - Campos: segmento [0..57), zona de errores desde 57 con ancho 26,
+         *     y longitudes intermedias de 83 para items no finales.
+         *   - En el último item, cerrar en allOkCode si aparece, o aplicar 83 chars como fallback.
          */
         private static String extractDetails(String data, String allOkCode) {
             String src = (data == null) ? "" : data;
@@ -1167,41 +1168,53 @@ public class McBatchSender {
             int start16 = src.indexOf("16");
             int startD0 = src.indexOf("D0");
             int start   = (start16 >= 0) ? start16 : (startD0 >= 0 ? startD0 : -1);
-            StringBuilder detail = new StringBuilder();
             if (start < 0) return "";
 
+            // Limpiar corchetes de bloques (legado)
             String cleaned = safeSub(src, start, src.length()).replace("[","").replace("]\n","");
 
+            // Separar por D0 (delimitador de registros de detalle)
             String[] detailsData = cleaned.split("D0", -1);
+            StringBuilder out = new StringBuilder();
+
             for (int i = 1; i < detailsData.length; i++) {
                 String seg = detailsData[i];
-                detail.append("16");
 
+                // Separador entre registros y prefijo D0 (requerido)
+                if (out.length() > 0) out.append('\n');
+                out.append("D0");
+
+                // Partes fijas
                 String head = seg.length() >= 57 ? seg.substring(0,57) : String.format("%-57s", seg);
                 String tail = seg.length()  > 57 ? seg.substring(57)   : "";
 
                 if (i == detailsData.length - 1) {
+                    // Último item
                     if (tail.length() < 26) {
                         String t = tail.trim();
                         if (t.length() > 15) t = t.substring(0, 15);
                         String codErrors = String.format("%26s", t);
-                        detail.append(head).append(codErrors).append(allOkCode);
+                        out.append(head).append(codErrors).append(allOkCode);
                     } else {
                         int okPos = seg.indexOf(allOkCode);
                         if (okPos >= 0) {
-                            detail.append(seg, 0, okPos + allOkCode.length());
+                            out.append(seg, 0, okPos + allOkCode.length());
                         } else {
-                            detail.append(seg, 0, Math.min(83, seg.length()));
+                            // Fallback legacy si no aparece el OK
+                            out.append(seg, 0, Math.min(83, seg.length()));
                         }
                     }
                     break;
                 }
 
-                detail.append(seg, 0, Math.min(83, seg.length()));
+                // Items intermedios: 83 chars
+                out.append(seg, 0, Math.min(83, seg.length()));
             }
 
-            return detail.toString().replace("D0", "\nD0");
+            // Ya imprimimos "D0" explícitamente por línea; no hace falta el replace("D0","\nD0")
+            return out.toString();
         }
+
 
         /** Valida fecha AAAAMMDD. */
         private static boolean validateDate(String date) {
@@ -1235,8 +1248,6 @@ public class McBatchSender {
             }
         }
 
-        // -------------------- Helpers NUEVOS para robustez --------------------
-
         /** Quita un 'T' al inicio de línea justo antes de 'H' (caso visto: "]\nTH000..." -> "]\nH000..."). */
         private static String normalizeTHArtifact(String s) {
             if (s == null) return "";
@@ -1259,5 +1270,4 @@ public class McBatchSender {
         }
     }
 }
-
 
