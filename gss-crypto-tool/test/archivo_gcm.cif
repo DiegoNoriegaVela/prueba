@@ -1,0 +1,5 @@
+#Encrypting properties
+#Fri Aug 29 19:04:23 GMT-05:00 2025
+pass=rlTRIh2r2YYVHdiB9SRV5HZwatgUIc6owpxHDVHBA1s1x9W7f1U=
+host=m79iia1NtO3U19pBZosLHjoKkXUOzlK3ZmLDgms15uGSjjoX0A==
+user=T6vJe+QGx2iIDIfUyUzZkoKfu3rcYgaVBZcK4DGf9DOj
