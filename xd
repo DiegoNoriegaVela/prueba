@@ -1,0 +1,19 @@
+cd \ruta\al\proyecto\gss-crypto-tool
+rmdir /s /q target 2>nul
+mkdir target\classes
+mkdir target\lib
+copy lib\*.jar target\lib\
+
+del /q sources.txt 2>nul
+for /R src\main\java %%f in (*.java) do @echo %%f>>sources.txt
+javac -encoding UTF-8 -cp "target\lib\*" -d target\classes @sources.txt
+
+Get-ChildItem -Recurse src/main/java -Filter *.java | % FullName > sources.txt
+javac -encoding UTF-8 -cp "target/lib/*" -d target/classes @sources.txt
+
+Main-Class: com.tu.paquete.MainClass
+Class-Path: lib/commons-io-2.6.jar lib/bcprov-jdk15on-1.51.jar lib/lombok-1.18.32.jar
+
+jar cfm target\gss-crypto-tool.jar target\MANIFEST.MF -C target\classes .
+
+java -jar target\gss-crypto-tool.jar
