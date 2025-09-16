@@ -1,1 +1,29 @@
-bdjej
+;WITH Capabilities AS (
+    SELECT
+        pmr.SistemaID,
+        pmr.PerfilID,
+        STRING_AGG(
+            CAST(
+                'Menu ' + CAST(pmr.MenuID AS nvarchar(50)) + ' - ' + ISNULL(m.Descripcion,'') +
+                ' | Recurso ' + CAST(pmr.RecursoID AS nvarchar(50)) + ' - ' + ISNULL(r.Descripcion,'')
+            AS nvarchar(max)),
+            N'; '
+        ) AS CapabilityFunctions
+    FROM (SELECT DISTINCT SistemaID, PerfilID, MenuID, RecursoID
+          FROM security.MaePerfilMenuRecurso) AS pmr
+    LEFT JOIN security.MaeMenu    AS m ON m.SistemaID = pmr.SistemaID AND m.MenuID = pmr.MenuID
+    LEFT JOIN security.MaeRecurso AS r ON r.RecursoID = pmr.RecursoID
+    GROUP BY pmr.SistemaID, pmr.PerfilID
+)
+SELECT
+    'Sistema: ' + ISNULL(s.DescripcionCorta, CAST(p.SistemaID AS nvarchar(50))) +
+    ' | Perfil: ' + ISNULL(p.Descripcion,     CAST(p.PerfilID  AS nvarchar(50))) AS RolesGroupsProfiles,
+    p.Descripcion            AS Descriptions,
+    cap.CapabilityFunctions  AS CapabilityFunctions,
+    CAST(NULL AS bit)        AS Privileged
+FROM security.MaePerfil AS p
+LEFT JOIN security.MaeSistema AS s
+       ON s.SistemaID = p.SistemaID
+LEFT JOIN Capabilities AS cap
+       ON cap.SistemaID = p.SistemaID
+      AND cap.PerfilID  = p.PerfilID;
