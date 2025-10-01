@@ -1,95 +1,111 @@
-import com.scotiabank.gssvault.util.AESFileCipher;
+// package com.scotiabank.gssvault.util;  // <- opcional
 
-import java.nio.file.*;
-import java.nio.charset.StandardCharsets;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Properties;
 
-public class TestCifrado {
+import com.scotiabank.gss.crypto.tool.crypt.AESFileCipher;
+import com.scotiabank.gss.crypto.tool.model.EncryptionException;
+
+public class AESFileCipherRunner {
+
+    private static void usage() {
+        System.out.println(
+            "Uso:\n" +
+            "  ENCRIPTAR: java -cp .;gss-crypto-tool-0.0.1-SNAPSHOT.jar AESFileCipherRunner encrypt <inPlain> <outEnc> (--key <secret> | --prop <app.properties>)\n" +
+            "  DESENCRIPT: java -cp .;gss-crypto-tool-0.0.1-SNAPSHOT.jar AESFileCipherRunner decrypt <inEnc>   <outPlain> (--key <secret> | --prop <app.properties>)\n" +
+            "\n" +
+            "Notas:\n" +
+            "  - Si usas --prop, se leerá la propiedad 'encrypt.secret'.\n" +
+            "  - En Linux/Mac usa ':' en vez de ';' en el classpath.\n"
+        );
+    }
+
     public static void main(String[] args) {
-        Path propsIn = Paths.get("test", "archivo.txt");  // .properties (clave=valor)
-        final String KEY_HEX = "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF"; // 64 hex (32B)
-        final String IV_HEX  = "AABBCCDDEEFF00112233445566778899";                                   // 32 hex (16B) (ECB lo ignora)
+        if (args.length < 4) {
+            usage();
+            System.exit(1);
+        }
 
+        String op = args[0].toLowerCase();          // encrypt | decrypt
+        String inPath = args[1];
+        String outPath = args[2];
+
+        // Parse key source
+        String key = null;
         try {
-            Files.createDirectories(Paths.get("test"));
-            if (!Files.exists(propsIn)) {
-                throw new IllegalStateException("Falta test/archivo.txt (formato .properties: clave=valor).");
+            for (int i = 3; i < args.length; i++) {
+                if ("--key".equalsIgnoreCase(args[i]) && i + 1 < args.length) {
+                    key = args[++i];
+                } else if ("--prop".equalsIgnoreCase(args[i]) && i + 1 < args.length) {
+                    key = loadKeyFromProperties(args[++i], "encrypt.secret");
+                }
             }
 
-            // 1) Como .properties (cifra/descifra por propiedad)
-            runProps("ECB", KEY_HEX, IV_HEX, propsIn);
-            runProps("CBC", KEY_HEX, IV_HEX, propsIn);
-            runProps("GCM", KEY_HEX, IV_HEX, propsIn);
+            if (key == null || key.isEmpty()) {
+                System.err.println("ERROR: no se obtuvo la clave. Usa --key <secret> o --prop <archivo.properties> con 'encrypt.secret'.");
+                System.exit(2);
+            }
 
-            // 2) Como archivo “cualquiera” (stream binario) usando el MISMO archivo.txt
-            runAny("ECB", KEY_HEX, IV_HEX, propsIn); // IV se ignora en ECB
-            runAny("CBC", KEY_HEX, IV_HEX, propsIn);
-            runAny("GCM", KEY_HEX, IV_HEX, propsIn);
+            // Validaciones rápidas de archivos
+            if (!Files.exists(Path.of(inPath))) {
+                System.err.println("ERROR: no existe el archivo de entrada: " + inPath);
+                System.exit(3);
+            }
+            Path out = Path.of(outPath);
+            if (Files.exists(out)) {
+                System.out.println("Aviso: el archivo de salida existe y será sobrescrito: " + outPath);
+            } else {
+                // Crea directorios padre si hiciera falta
+                Path parent = out.getParent();
+                if (parent != null) Files.createDirectories(parent);
+            }
 
-            System.out.println("\nListo. Revisa la carpeta test/ para los *.cif y *.dec");
-        } catch (Exception e) {
+            long t0 = System.currentTimeMillis();
+
+            if ("encrypt".equals(op)) {
+                AESFileCipher.encryptContentFile(inPath, outPath, key);
+                System.out.println("OK: Archivo cifrado -> " + outPath);
+            } else if ("decrypt".equals(op)) {
+                AESFileCipher.decryptContentFile(inPath, outPath, key);
+                System.out.println("OK: Archivo descifrado -> " + outPath);
+            } else {
+                System.err.println("ERROR: operación desconocida: " + op);
+                usage();
+                System.exit(4);
+            }
+
+            long t1 = System.currentTimeMillis();
+            System.out.println("Tiempo: " + (t1 - t0) + " ms");
+
+        } catch (EncryptionException e) {
+            System.err.println("Fallo de cifrado/descifrado: " + e.getMessage());
             e.printStackTrace();
-            System.exit(1);
+            System.exit(5);
+        } catch (Exception e) {
+            System.err.println("Error inesperado: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(6);
         }
     }
 
-    // ====== .properties con FileEncrypt/FileDecrypt ======
-    private static void runProps(String type, String keyHex, String ivHex, Path input) throws Exception {
-        String suf = type.toLowerCase();
-        Path cipherOut = Paths.get("test", "archivo_" + suf + ".cif");
-        Path plainOut  = Paths.get("test", "archivo_" + suf + ".dec");
-
-        String[] encArgs = new String[6];
-        encArgs[0] = type;                 // tu validateArgs lo usa
-        encArgs[1] = input.toString();
-        encArgs[2] = keyHex;
-        encArgs[3] = ivHex;                // ECB lo ignora internamente
-        encArgs[4] = cipherOut.toString();
-        encArgs[5] = type;
-        new AESFileCipher().FileEncrypt(encArgs);
-
-        String[] decArgs = new String[6];
-        decArgs[0] = type;
-        decArgs[1] = cipherOut.toString();
-        decArgs[2] = keyHex;
-        decArgs[3] = ivHex;
-        decArgs[4] = plainOut.toString();
-        decArgs[5] = type;
-        AESFileCipher.FileDecrypt(decArgs);
-
-        String inTxt  = Files.readString(input,  StandardCharsets.UTF_8).trim();
-        String outTxt = Files.readString(plainOut, StandardCharsets.UTF_8).trim();
-        System.out.println("[PROPS] " + type + " -> " + (inTxt.equals(outTxt) ? "OK ✅" : "MISMATCH ❌"));
-    }
-
-    // ====== archivo cualquiera con FileEncryptAny/FileDecryptAny ======
-    private static void runAny(String type, String keyHex, String ivHex, Path input) throws Exception {
-        String suf = type.toLowerCase();
-        Path cipherOut = Paths.get("test", "archivo_file_" + suf + ".cif");
-        Path plainOut  = Paths.get("test", "archivo_file_" + suf + ".dec");
-
-        String[] encArgs = new String[6];
-        encArgs[0] = type;                 // para validateArgs()
-        encArgs[1] = input.toString();     // aquí reutilizamos archivo.txt como “archivo general”
-        encArgs[2] = keyHex;
-        encArgs[3] = ivHex;                // ECB lo ignora
-        encArgs[4] = cipherOut.toString();
-        encArgs[5] = type;
-        AESFileCipher.FileEncryptAny(encArgs);
-
-        String[] decArgs = new String[6];
-        decArgs[0] = type;
-        decArgs[1] = cipherOut.toString();
-        decArgs[2] = keyHex;
-        decArgs[3] = ivHex;                // ECB lo ignora
-        decArgs[4] = plainOut.toString();
-        decArgs[5] = type;
-        AESFileCipher.FileDecryptAny(decArgs);
-
-        boolean iguales = Files.mismatch(input, plainOut) == -1;
-        System.out.println("[FILE ] " + type + " -> " + (iguales ? "OK ✅" : "MISMATCH ❌"));
+    private static String loadKeyFromProperties(String file, String propName) throws IOException {
+        Properties p = new Properties();
+        try (FileInputStream fis = new FileInputStream(file)) {
+            p.load(fis);
+        }
+        String v = p.getProperty(propName);
+        if (v == null || v.isEmpty()) {
+            throw new IllegalArgumentException("No se encontró la propiedad '" + propName + "' en " + file);
+        }
+        return v.trim();
     }
 }
 
-//user=diego
-//pass=MiCl@ve123
-//host=127.0.0.1
+javac -cp gss-crypto-tool-0.0.1-SNAPSHOT.jar AESFileCipherRunner.java
+java -cp .;gss-crypto-tool-0.0.1-SNAPSHOT.jar AESFileCipherRunner encrypt "C:\ruta\plain.txt" "C:\ruta\plain.txt.enc" --key "m56jFdeY19enc51Ksjk74503g1gd457A"
+java -cp .;gss-crypto-tool-0.0.1-SNAPSHOT.jar AESFileCipherRunner decrypt "C:\ruta\plain.txt.enc" "C:\ruta\plain.txt.dec" --key "m56jFdeY19enc51Ksjk74503g1gd457A"
+java -cp .;gss-crypto-tool-0.0.1-SNAPSHOT.jar AESFileCipherRunner encrypt "C:\in\archivo.pdf" "C:\out\archivo.pdf.enc" --prop "C:\conf\application.properties"
+
