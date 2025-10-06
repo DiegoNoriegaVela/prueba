@@ -1,111 +1,196 @@
-// package com.scotiabank.gssvault.util;  // <- opcional
+Opción 3 → descarga de archivo con nomenclatura YTF.AR.T120.F.<ENTITY>.D<yymmdd>.T<NOMBRE>.A001
 
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.Properties;
+Opción 4 → igual, pero con T112
 
-import com.scotiabank.gss.crypto.tool.crypt.AESFileCipher;
-import com.scotiabank.gss.crypto.tool.model.EncryptionException;
+NOMBRE lo pasas por CLI (lo tomamos del FILE_NAME que ya pasas como tercer argumento).
 
-public class AESFileCipherRunner {
+A001 fijo.
 
-    private static void usage() {
-        System.out.println(
-            "Uso:\n" +
-            "  ENCRIPTAR: java -cp .;gss-crypto-tool-0.0.1-SNAPSHOT.jar AESFileCipherRunner encrypt <inPlain> <outEnc> (--key <secret> | --prop <app.properties>)\n" +
-            "  DESENCRIPT: java -cp .;gss-crypto-tool-0.0.1-SNAPSHOT.jar AESFileCipherRunner decrypt <inEnc>   <outPlain> (--key <secret> | --prop <app.properties>)\n" +
-            "\n" +
-            "Notas:\n" +
-            "  - Si usas --prop, se leerá la propiedad 'encrypt.secret'.\n" +
-            "  - En Linux/Mac usa ':' en vez de ';' en el classpath.\n"
-        );
-    }
+Sin análisis: se guarda tal cual (como la opción 2 en modo “crudo”).
 
-    public static void main(String[] args) {
-        if (args.length < 4) {
-            usage();
-            System.exit(1);
-        }
+<ENTITY> configurable por INI con clave report.entity (si no lo pones, usa E0002840).
 
-        String op = args[0].toLowerCase();          // encrypt | decrypt
-        String inPath = args[1];
-        String outPath = args[2];
+No necesitas tocar nada más fuera de lo que te pongo aquí.
 
-        // Parse key source
-        String key = null;
-        try {
-            for (int i = 3; i < args.length; i++) {
-                if ("--key".equalsIgnoreCase(args[i]) && i + 1 < args.length) {
-                    key = args[++i];
-                } else if ("--prop".equalsIgnoreCase(args[i]) && i + 1 < args.length) {
-                    key = loadKeyFromProperties(args[++i], "encrypt.secret");
-                }
-            }
+1) Config: agrega el campo reportEntity
+a) En la clase Config, añade el campo:
+final String reportEntity;
 
-            if (key == null || key.isEmpty()) {
-                System.err.println("ERROR: no se obtuvo la clave. Usa --key <secret> o --prop <archivo.properties> con 'encrypt.secret'.");
-                System.exit(2);
-            }
+b) Cambia el constructor de Config para incluir reportEntity:
 
-            // Validaciones rápidas de archivos
-            if (!Files.exists(Path.of(inPath))) {
-                System.err.println("ERROR: no existe el archivo de entrada: " + inPath);
-                System.exit(3);
-            }
-            Path out = Path.of(outPath);
-            if (Files.exists(out)) {
-                System.out.println("Aviso: el archivo de salida existe y será sobrescrito: " + outPath);
-            } else {
-                // Crea directorios padre si hiciera falta
-                Path parent = out.getParent();
-                if (parent != null) Files.createDirectories(parent);
-            }
+Busca el constructor y reemplázalo por este (solo añadí reportEntity antes de reportNameTemplate):
 
-            long t0 = System.currentTimeMillis();
-
-            if ("encrypt".equals(op)) {
-                AESFileCipher.encryptContentFile(inPath, outPath, key);
-                System.out.println("OK: Archivo cifrado -> " + outPath);
-            } else if ("decrypt".equals(op)) {
-                AESFileCipher.decryptContentFile(inPath, outPath, key);
-                System.out.println("OK: Archivo descifrado -> " + outPath);
-            } else {
-                System.err.println("ERROR: operación desconocida: " + op);
-                usage();
-                System.exit(4);
-            }
-
-            long t1 = System.currentTimeMillis();
-            System.out.println("Tiempo: " + (t1 - t0) + " ms");
-
-        } catch (EncryptionException e) {
-            System.err.println("Fallo de cifrado/descifrado: " + e.getMessage());
-            e.printStackTrace();
-            System.exit(5);
-        } catch (Exception e) {
-            System.err.println("Error inesperado: " + e.getMessage());
-            e.printStackTrace();
-            System.exit(6);
-        }
-    }
-
-    private static String loadKeyFromProperties(String file, String propName) throws IOException {
-        Properties p = new Properties();
-        try (FileInputStream fis = new FileInputStream(file)) {
-            p.load(fis);
-        }
-        String v = p.getProperty(propName);
-        if (v == null || v.isEmpty()) {
-            throw new IllegalArgumentException("No se encontró la propiedad '" + propName + "' en " + file);
-        }
-        return v.trim();
-    }
+private Config(String host, int port, int connectTimeoutMs, int soTimeoutMs, int chunkSize,
+               Path dataFilePath, Path historyFilePath, List<String> acceptedCodes,
+               String alreadySentSubstring, String defaultFailCode,
+               Charset codePage, String dateOverride,
+               String nameTemplate, String fileNameTemplate,
+               String reportEntity, String reportNameTemplate, boolean reportProcess) {
+    this.host = host;
+    this.port = port;
+    this.connectTimeoutMs = connectTimeoutMs;
+    this.soTimeoutMs = soTimeoutMs;
+    this.chunkSize = chunkSize;
+    this.dataFilePath = dataFilePath;
+    this.historyFilePath = historyFilePath;
+    this.acceptedCodes = acceptedCodes;
+    this.alreadySentSubstring = alreadySentSubstring;
+    this.defaultFailCode = defaultFailCode;
+    this.codePage = codePage;
+    this.dateOverride = dateOverride;
+    this.nameTemplate = nameTemplate;
+    this.fileNameTemplate = fileNameTemplate;
+    this.reportEntity = reportEntity;          // <--- NUEVO
+    this.reportNameTemplate = reportNameTemplate;
+    this.reportProcess = reportProcess;
 }
 
-javac -cp gss-crypto-tool-0.0.1-SNAPSHOT.jar AESFileCipherRunner.java
-java -cp .;gss-crypto-tool-0.0.1-SNAPSHOT.jar AESFileCipherRunner encrypt "C:\ruta\plain.txt" "C:\ruta\plain.txt.enc" --key "m56jFdeY19enc51Ksjk74503g1gd457A"
-java -cp .;gss-crypto-tool-0.0.1-SNAPSHOT.jar AESFileCipherRunner decrypt "C:\ruta\plain.txt.enc" "C:\ruta\plain.txt.dec" --key "m56jFdeY19enc51Ksjk74503g1gd457A"
-java -cp .;gss-crypto-tool-0.0.1-SNAPSHOT.jar AESFileCipherRunner encrypt "C:\in\archivo.pdf" "C:\out\archivo.pdf.enc" --prop "C:\conf\application.properties"
+c) En Config.from(...), lee la clave del INI y pásala al constructor
 
+Dentro de from(...), después de leer fileNameTemplate, añade:
+
+String reportEntity = s.getOrDefault("report.entity", "E0002840"); // NUEVO: entidad fija del prefijo
+
+
+Y modifica el return new Config(... para incluir reportEntity en el lugar indicado:
+
+return new Config(host, port, connectTimeout, soTimeout, chunk,
+                  dataPath, histPath, acceptedList, already, failDef,
+                  cp, dateOverride, nameTemplate, fileNameTemplate,
+                  reportEntity, reportNameTemplate, reportProcess); // <-- pasar reportEntity
+
+d) (Opcional, útil) Loguea la entidad
+
+En main(...), donde haces los logger.info(...) de configuración, añade:
+
+logger.info("report.entity: " + cfg.reportEntity);
+
+2) Sender.run(): agrega las nuevas opciones 3 y 4
+
+En el método run(), cambia el if por este:
+
+void run() {
+    if (option == 1) runSend();
+    else if (option == 2) runReport();
+    else if (option == 3) runDownloadByNomenclature(120); // NUEVO
+    else if (option == 4) runDownloadByNomenclature(112); // NUEVO
+    else throw new IllegalArgumentException("OPCION invalida: " + option);
+}
+
+3) Nueva función: descargar por nomenclatura (T120/T112)
+
+Añade este método dentro de la clase Sender:
+
+/**
+ * OPCION 3/4: Descarga un archivo por nomenclatura:
+ *   YTF.AR.T{tCode}.F.{ENTITY}.D{yymmdd}.T{nombre}.A001
+ * - {ENTITY}: cfg.reportEntity (INI: report.entity, default E0002840)
+ * - {yymmdd}: desde this.date (YYYYMMDD -> YYMMDD)
+ * - {nombre}: tomado de fileNameArg (CLI)
+ * Guarda el archivo tal cual (crudo), sin procesar.
+ */
+private void runDownloadByNomenclature(int tCode) {
+    logger.info("=== OPCION " + (tCode == 120 ? "3" : "4") + ": Descarga por nomenclatura T" + tCode + " ===");
+
+    // nombre = parámetro CLI (reutilizamos fileNameArg)
+    if (fileNameArg == null || fileNameArg.trim().isEmpty()) {
+        throw new IllegalArgumentException("Debe proporcionar el NOMBRE para el componente 'T{nombre}' como tercer argumento.");
+    }
+    String nombre = fileNameArg.trim();
+
+    // Fecha YYMMDD derivada de this.date (YYYYMMDD)
+    LocalDate d = LocalDate.parse(this.date, DateTimeFormatter.BASIC_ISO_DATE);
+    String yymmdd = String.format("%02d%02d%02d", d.getYear() % 100, d.getMonthValue(), d.getDayOfMonth());
+
+    // Construir nombre completo
+    String queryName = "YTF.AR.T" + tCode + ".F." + cfg.reportEntity + ".D" + yymmdd + ".T" + nombre + ".A001";
+    logger.info("Nombre de archivo a solicitar: " + queryName);
+
+    try (Socket sock = new Socket()) {
+        logger.info("[IP:" + cfg.host + "][PTO:" + cfg.port + "]");
+        sock.connect(new InetSocketAddress(cfg.host, cfg.port), cfg.connectTimeoutMs);
+        sock.setSoTimeout(cfg.soTimeoutMs);
+        logger.info("Estado de conexion con el MIP: " + sock.isConnected());
+
+        // Enviar nombre tal cual
+        writeNameFrame(sock, queryName, cfg.codePage);
+
+        // Leer múltiples bloques "legacy" hasta ver el prefijo de OK (p.ej. "998010")
+        StringBuilder rawAcc = new StringBuilder();
+        boolean moreData = true;
+        while (moreData) {
+            String chunk = readLegacyBlock(sock, cfg.codePage); // 1 read(1024) + filtro imprimibles
+            rawAcc.append(chunk);
+
+            if (chunk.isEmpty() || containsAnyAcceptedPrefix(rawAcc.toString(), cfg.acceptedCodes)) {
+                moreData = false;
+            }
+        }
+
+        // ¿Respuesta encontrada? (presencia de un acceptedCode completo)
+        if (containsAny(rawAcc.toString(), cfg.acceptedCodes)) {
+            logger.info("Archivo encontrado [OK] -> guardando crudo");
+            writeRawToNamedFile(queryName, rawAcc.toString());
+            logger.info("*** Descarga completada: [OK]");
+        } else {
+            logger.severe("*** Respuesta del MIP: Archivo no encontrado [FAIL]");
+        }
+
+    } catch (UnknownHostException e) {
+        logger.severe("Host desconocido: " + e.getMessage());
+    } catch (SocketTimeoutException e) {
+        logger.severe("Timeout de socket: " + e.getMessage());
+    } catch (ConnectException e) {
+        logger.severe("No se pudo conectar a " + cfg.host + ":" + cfg.port + " - " + e.getMessage());
+    } catch (IOException e) {
+        logger.severe("IO de red fallo: " + e.getMessage());
+    } catch (Exception e) {
+        logger.severe("Error inesperado en descarga por nomenclatura: " + e.getMessage());
+    }
+
+    logger.info("=== PROCESO FINALIZADO (OPCION " + (tCode == 120 ? "3" : "4") + ") ===");
+}
+
+4) Guardar crudo con el nombre exacto
+
+Añade este helper dentro de la clase Sender (lo usa el método anterior):
+
+/** Escribe datos crudos con el nombre exacto del archivo solicitado. */
+private static void writeRawToNamedFile(String fileName, String data) throws IOException {
+    try (FileOutputStream fos = new FileOutputStream(fileName);
+         PrintStream ps = new PrintStream(fos, true, "UTF-8")) {
+        ps.print(data);
+    }
+    logger.info("Archivo escrito: " + fileName);
+}
+
+5) INI (por sección)
+
+Añade en tu INI (ej. [MIP], [GCO]) la entidad fija si deseas otra:
+
+# Para opciones 3/4 (descarga por nomenclatura)
+report.entity=E0002840
+
+
+Si no la pones, el código usa E0002840 por defecto.
+
+Ejemplos de uso
+
+T120 (opción 3), nombre T184316, fecha 20250925:
+
+java McBatchSender 3 MIP T184316 20250925
+
+
+Buscará y descargará:
+
+YTF.AR.T120.F.E0002840.D250925.T184316.A001
+
+
+T112 (opción 4), nombre MIARCHIVO, fecha tomada del día:
+
+java McBatchSender 4 MIP MIARCHIVO
+
+
+Buscará:
+
+YTF.AR.T112.F.E0002840.D<yymmdd_de_hoy>.TMIARCHIVO.A001
