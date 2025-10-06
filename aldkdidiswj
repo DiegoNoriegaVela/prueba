@@ -896,6 +896,30 @@ public class McBatchSender {
             os.flush();
         }
 
+        // Lee una respuesta del socket y la decodifica desde EBCDIC.
+        // Lee hasta que:
+        //  - read() devuelve -1, o
+        //  - la ultima lectura es menor que el tamano del buffer, o
+        //  - hay timeout: si ya hay datos acumulados, devuelve; si no, relanza.
+        private static String readResponse(Socket s, Charset ebcdic) throws IOException {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            InputStream is = s.getInputStream();
+            byte[] buf = new byte[1024];
+            while (true) {
+                try {
+                    int n = is.read(buf);
+                    if (n == -1) break;
+                    baos.write(buf, 0, n);
+                    if (n < buf.length) break;
+                } catch (SocketTimeoutException te) {
+                    if (baos.size() == 0) throw te; // si no llego nada, propaga timeout
+                    break;                           // si ya hay datos, corta y devuelve
+                }
+            }
+            byte[] ebcdicBytes = baos.toByteArray();
+            return new String(ebcdicBytes, ebcdic);
+        }
+
         private static String readLegacyBlock(Socket s, Charset ebcdic) throws IOException {
             InputStream is = s.getInputStream();
             byte[] buf = new byte[1024];
@@ -1106,3 +1130,4 @@ public class McBatchSender {
         }
     }
 }
+
