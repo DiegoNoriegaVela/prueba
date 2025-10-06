@@ -1,196 +1,1139 @@
-Opción 3 → descarga de archivo con nomenclatura YTF.AR.T120.F.<ENTITY>.D<yymmdd>.T<NOMBRE>.A001
+//=================================================================================================
+// McBatchSender
+//
+// Proposito:
+//   Envia un archivo de datos a un hub (ej. Mastercard) por TCP (Opcion 1) y genera/descarga
+//   reportes/respuestas (Opcion 2, 3 y 4), manteniendo el comportamiento del original con
+//   mejoras de robustez y simplicidad.
+//
+// Protocolo:
+//   - Cada trama: header de 2 bytes (longitud big-endian) + cuerpo en EBCDIC (interno Cp037).
+//   - Opcion 1 (envio): cada parte se envía con prefijo ASCII 'R' antes del cuerpo y luego
+//     se convierte a EBCDIC. Trailer final: 11 bytes = EBCDIC(acceptedCode de 7 chars) + contador(4B).
+//
+// Flujo (resumen):
+//   Opcion 1 (Envio):
+//     1) Valida permisos (CWD, dataFile, historico).
+//     2) Lee dataFilePath, parte en chunkSize, determina FILE_NAME (CLI o fileNameTemplate).
+//     3) Arma nombre con nameTemplate y hace handshake (acceptedCode / alreadySentSubstring).
+//     4) Envia tramas y trailer 11B, espera confirmacion final (acceptedCode), actualiza historico.
+//
+//   Opcion 2 (Reporte “MIP”):
+//     1) Valida permisos (CWD con escritura).
+//     2) Determina FILE_NAME (CLI o fileNameTemplate).
+//     3) Arma nombre base desde reportNameTemplate y consulta secuencias 01..99.
+//     4) Si report.process=Y (o se elige en modo interactivo): procesa headers+details;
+//        si N: escribe el contenido crudo tal cual.
+//     5) Genera archivo NNNN-YYYYMMDD-Archivo de Cambio Confirmacion.
+//
+//   Opcion 3 (Descarga por nomenclatura T120) / Opcion 4 (T112):
+//     - Descarga directa (crudo) del archivo con formato:
+//       YTF.AR.T{120|112}.F.{ENTITY}.D{YYMMDD}.{FILE}.A001
+//       (ENTITY desde INI report.entity, por defecto E0002840; FILE ingresado).
+//
+// Parametrizacion (INI):
+//   - host, port, connectTimeoutMs, soTimeoutMs, chunkSize
+//   - dataFilePath, historyFilePath
+//   - acceptedCode (lista separada por comas; uno de 7 chars se usa en trailer)
+//   - alreadySentSubstring, defaultFailCode
+//   - date (YYYYMMDD opcional para plantillas; ignorada si CLI/menú define fecha)
+//   - nameTemplate (p.ej. "00401{file}{julian}")
+//   - fileNameTemplate (si no pasas FILE_NAME en CLI/menú): literal, {rand}, {ddmm} -> 9 chars exactos
+//   - reportNameTemplate (p.ej. "10101{file}{julian}") para Opcion 2
+//   - report.process=Y|N (Y=procesa headers+details; N=escribe crudo)
+//   - report.entity=E0002840 (usada en opciones 3/4)
+//   *** NOTA: YA NO SE LEE "codePage" DEL INI (se usa Cp037 internamente). ***
+//
+// Uso (modo parámetros: obligatorio todo):
+//   javac McBatchSender.java
+//   java McBatchSender <OPCION> <SECCION> <FILE_NAME> <DATE>  [-Dmcsender.config=/ruta/mcsender.ini]
+//
+//   - <OPCION>    : 1=Envio, 2=Reporte MIP, 3=Descarga T120, 4=Descarga T112
+//   - <SECCION>   : nombre de la seccion del INI (ej. MIP, GCO)
+//   - <FILE_NAME> : para 1/2: nombre lógico (cualquier longitud); si quieres usar template deja "" en modo menú
+//                   para 3/4: componente {FILE} del nombre YTF.AR... (cualquier longitud)
+//   - <DATE>      : AAAAMMDD
+//
+// Uso (sin parámetros): menú interactivo para elegir opción/sección/nombre/fecha y parseo (opción 2).
+//
+// Codigos de salida:
+//   0=OK | 1=error inesperado | 2=uso invalido | 3=INI no encontrado | 4=INI/argumento invalido
+//=================================================================================================
 
-Opción 4 → igual, pero con T112
+import java.io.*;
+import java.net.*;
+import java.nio.charset.Charset;
+import java.nio.charset.MalformedInputException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.nio.channels.FileChannel;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.logging.Logger;
 
-NOMBRE lo pasas por CLI (lo tomamos del FILE_NAME que ya pasas como tercer argumento).
+public class McBatchSender {
+    private static final Logger logger = Logger.getLogger(McBatchSender.class.getName());
 
-A001 fijo.
+    // EBCDIC fijo (ya no configurable por INI)
+    private static final Charset EBCDIC = Charset.forName("Cp037");
 
-Sin análisis: se guarda tal cual (como la opción 2 en modo “crudo”).
+    /**
+     * Punto de entrada.
+     * - Con 0 parámetros: muestra menú interactivo.
+     * - Con 4 parámetros: <OPCION> <SECCION> <FILE_NAME> <DATE> (formato fijo y requerido).
+     */
+    public static void main(String[] args) {
+        final String iniPath = System.getProperty("mcsender.config", "mcsender.ini");
+        final Path ini = Paths.get(iniPath);
 
-<ENTITY> configurable por INI con clave report.entity (si no lo pones, usa E0002840).
-
-No necesitas tocar nada más fuera de lo que te pongo aquí.
-
-1) Config: agrega el campo reportEntity
-a) En la clase Config, añade el campo:
-final String reportEntity;
-
-b) Cambia el constructor de Config para incluir reportEntity:
-
-Busca el constructor y reemplázalo por este (solo añadí reportEntity antes de reportNameTemplate):
-
-private Config(String host, int port, int connectTimeoutMs, int soTimeoutMs, int chunkSize,
-               Path dataFilePath, Path historyFilePath, List<String> acceptedCodes,
-               String alreadySentSubstring, String defaultFailCode,
-               Charset codePage, String dateOverride,
-               String nameTemplate, String fileNameTemplate,
-               String reportEntity, String reportNameTemplate, boolean reportProcess) {
-    this.host = host;
-    this.port = port;
-    this.connectTimeoutMs = connectTimeoutMs;
-    this.soTimeoutMs = soTimeoutMs;
-    this.chunkSize = chunkSize;
-    this.dataFilePath = dataFilePath;
-    this.historyFilePath = historyFilePath;
-    this.acceptedCodes = acceptedCodes;
-    this.alreadySentSubstring = alreadySentSubstring;
-    this.defaultFailCode = defaultFailCode;
-    this.codePage = codePage;
-    this.dateOverride = dateOverride;
-    this.nameTemplate = nameTemplate;
-    this.fileNameTemplate = fileNameTemplate;
-    this.reportEntity = reportEntity;          // <--- NUEVO
-    this.reportNameTemplate = reportNameTemplate;
-    this.reportProcess = reportProcess;
-}
-
-c) En Config.from(...), lee la clave del INI y pásala al constructor
-
-Dentro de from(...), después de leer fileNameTemplate, añade:
-
-String reportEntity = s.getOrDefault("report.entity", "E0002840"); // NUEVO: entidad fija del prefijo
-
-
-Y modifica el return new Config(... para incluir reportEntity en el lugar indicado:
-
-return new Config(host, port, connectTimeout, soTimeout, chunk,
-                  dataPath, histPath, acceptedList, already, failDef,
-                  cp, dateOverride, nameTemplate, fileNameTemplate,
-                  reportEntity, reportNameTemplate, reportProcess); // <-- pasar reportEntity
-
-d) (Opcional, útil) Loguea la entidad
-
-En main(...), donde haces los logger.info(...) de configuración, añade:
-
-logger.info("report.entity: " + cfg.reportEntity);
-
-2) Sender.run(): agrega las nuevas opciones 3 y 4
-
-En el método run(), cambia el if por este:
-
-void run() {
-    if (option == 1) runSend();
-    else if (option == 2) runReport();
-    else if (option == 3) runDownloadByNomenclature(120); // NUEVO
-    else if (option == 4) runDownloadByNomenclature(112); // NUEVO
-    else throw new IllegalArgumentException("OPCION invalida: " + option);
-}
-
-3) Nueva función: descargar por nomenclatura (T120/T112)
-
-Añade este método dentro de la clase Sender:
-
-/**
- * OPCION 3/4: Descarga un archivo por nomenclatura:
- *   YTF.AR.T{tCode}.F.{ENTITY}.D{yymmdd}.T{nombre}.A001
- * - {ENTITY}: cfg.reportEntity (INI: report.entity, default E0002840)
- * - {yymmdd}: desde this.date (YYYYMMDD -> YYMMDD)
- * - {nombre}: tomado de fileNameArg (CLI)
- * Guarda el archivo tal cual (crudo), sin procesar.
- */
-private void runDownloadByNomenclature(int tCode) {
-    logger.info("=== OPCION " + (tCode == 120 ? "3" : "4") + ": Descarga por nomenclatura T" + tCode + " ===");
-
-    // nombre = parámetro CLI (reutilizamos fileNameArg)
-    if (fileNameArg == null || fileNameArg.trim().isEmpty()) {
-        throw new IllegalArgumentException("Debe proporcionar el NOMBRE para el componente 'T{nombre}' como tercer argumento.");
-    }
-    String nombre = fileNameArg.trim();
-
-    // Fecha YYMMDD derivada de this.date (YYYYMMDD)
-    LocalDate d = LocalDate.parse(this.date, DateTimeFormatter.BASIC_ISO_DATE);
-    String yymmdd = String.format("%02d%02d%02d", d.getYear() % 100, d.getMonthValue(), d.getDayOfMonth());
-
-    // Construir nombre completo
-    String queryName = "YTF.AR.T" + tCode + ".F." + cfg.reportEntity + ".D" + yymmdd + ".T" + nombre + ".A001";
-    logger.info("Nombre de archivo a solicitar: " + queryName);
-
-    try (Socket sock = new Socket()) {
-        logger.info("[IP:" + cfg.host + "][PTO:" + cfg.port + "]");
-        sock.connect(new InetSocketAddress(cfg.host, cfg.port), cfg.connectTimeoutMs);
-        sock.setSoTimeout(cfg.soTimeoutMs);
-        logger.info("Estado de conexion con el MIP: " + sock.isConnected());
-
-        // Enviar nombre tal cual
-        writeNameFrame(sock, queryName, cfg.codePage);
-
-        // Leer múltiples bloques "legacy" hasta ver el prefijo de OK (p.ej. "998010")
-        StringBuilder rawAcc = new StringBuilder();
-        boolean moreData = true;
-        while (moreData) {
-            String chunk = readLegacyBlock(sock, cfg.codePage); // 1 read(1024) + filtro imprimibles
-            rawAcc.append(chunk);
-
-            if (chunk.isEmpty() || containsAnyAcceptedPrefix(rawAcc.toString(), cfg.acceptedCodes)) {
-                moreData = false;
+        if (args.length == 0) {
+            // Modo interactivo
+            try {
+                IniFile cfgFile = IniFile.load(ini);
+                Interactive.runInteractive(cfgFile);
+                System.exit(0);
+            } catch (NoSuchFileException e) {
+                System.err.println("No se encontro el archivo de configuracion: " + e.getFile());
+                System.exit(3);
+            } catch (Exception e) {
+                System.err.println("Error inesperado en modo interactivo: " + e.getMessage());
+                System.exit(1);
             }
         }
 
-        // ¿Respuesta encontrada? (presencia de un acceptedCode completo)
-        if (containsAny(rawAcc.toString(), cfg.acceptedCodes)) {
-            logger.info("Archivo encontrado [OK] -> guardando crudo");
-            writeRawToNamedFile(queryName, rawAcc.toString());
-            logger.info("*** Descarga completada: [OK]");
-        } else {
-            logger.severe("*** Respuesta del MIP: Archivo no encontrado [FAIL]");
+        if (args.length != 4) {
+            System.err.println("Uso: java McBatchSender <OPCION> <SECCION> <FILE_NAME> <DATE>  [-Dmcsender.config=/ruta/mcsender.ini]");
+            System.exit(2);
         }
 
-    } catch (UnknownHostException e) {
-        logger.severe("Host desconocido: " + e.getMessage());
-    } catch (SocketTimeoutException e) {
-        logger.severe("Timeout de socket: " + e.getMessage());
-    } catch (ConnectException e) {
-        logger.severe("No se pudo conectar a " + cfg.host + ":" + cfg.port + " - " + e.getMessage());
-    } catch (IOException e) {
-        logger.severe("IO de red fallo: " + e.getMessage());
-    } catch (Exception e) {
-        logger.severe("Error inesperado en descarga por nomenclatura: " + e.getMessage());
+        final String optionStr = args[0].trim();
+        final int option;
+        try {
+            option = Integer.parseInt(optionStr);
+        } catch (NumberFormatException nfe) {
+            System.err.println("OPCION debe ser 1, 2, 3 o 4. Valor: '" + optionStr + "'");
+            System.exit(4); return;
+        }
+        if (option < 1 || option > 4) {
+            System.err.println("OPCION invalida. Use 1 (envio), 2 (reporte), 3 (T120), 4 (T112).");
+            System.exit(4);
+        }
+
+        final String section = args[1].trim();
+        final String fileNameArg = args[2].trim().isEmpty() ? null : args[2].trim().toUpperCase();
+        final String cliDateParam = args[3].trim();
+
+        if (!validateDate(cliDateParam)) {
+            System.err.println("DATE debe ser AAAAMMDD. Valor: '" + cliDateParam + "'");
+            System.exit(4);
+        }
+
+        try {
+            IniFile cfgFile = IniFile.load(ini);
+            Config cfg = Config.from(cfgFile, section);
+
+            logger.info("OPCION: " + option);
+            logger.info("Host: " + cfg.host + " (" + cfg.host.length() + ")");
+            logger.info("Puerto: " + cfg.port + " (" + String.valueOf(cfg.port).length() + ")");
+            logger.info("nameTemplate: " + cfg.nameTemplate);
+            logger.info("acceptedCodes: " + cfg.acceptedCodes);
+            logger.info("trailerCode (7 chars): " + cfg.trailerCodeSeven());
+            logger.info("reportNameTemplate: " + cfg.reportNameTemplate + " | report.process=" + (cfg.reportProcess ? "Y" : "N"));
+            logger.info("report.entity: " + cfg.reportEntity);
+            logger.info("DATE (CLI): " + cliDateParam);
+            logger.info("FILE_NAME (CLI): " + (fileNameArg == null ? "<VACIO>" : fileNameArg));
+
+            new Sender(cfg, option, fileNameArg, cliDateParam, null).run();
+            System.exit(0);
+        } catch (NoSuchFileException e) {
+            System.err.println("No se encontro el archivo de configuracion: " + e.getFile());
+            System.exit(3);
+        } catch (IllegalArgumentException e) {
+            System.err.println("Configuracion/argumento invalido: " + e.getMessage());
+            System.exit(4);
+        } catch (Exception e) {
+            System.err.println("Error inesperado: " + e.getMessage());
+            System.exit(1);
+        }
     }
 
-    logger.info("=== PROCESO FINALIZADO (OPCION " + (tCode == 120 ? "3" : "4") + ") ===");
-}
+    // -------------------------------- Interactivo --------------------------------
 
-4) Guardar crudo con el nombre exacto
+    static class Interactive {
+        static void runInteractive(IniFile cfgFile) throws Exception {
+            Scanner sc = new Scanner(System.in);
 
-Añade este helper dentro de la clase Sender (lo usa el método anterior):
+            // Mostrar secciones disponibles
+            List<String> sections = new ArrayList<>(cfgFile.data.keySet());
+            if (sections.isEmpty()) throw new IllegalArgumentException("El INI no contiene secciones.");
+            System.out.println("\n=== McBatchSender (Modo Interactivo) ===");
+            System.out.println("Secciones disponibles: " + String.join(", ", sections));
 
-/** Escribe datos crudos con el nombre exacto del archivo solicitado. */
-private static void writeRawToNamedFile(String fileName, String data) throws IOException {
-    try (FileOutputStream fos = new FileOutputStream(fileName);
-         PrintStream ps = new PrintStream(fos, true, "UTF-8")) {
-        ps.print(data);
+            // 1) Opción
+            System.out.println("\nOpciones:");
+            System.out.println("  1) Envío (envía archivo de datos - Opcion 1)");
+            System.out.println("  2) Reporte MIP (consulta 10101... - Opcion 2)");
+            System.out.println("  3) Descarga por nomenclatura T120 (YTF.AR.T120...) - Opcion 3");
+            System.out.println("  4) Descarga por nomenclatura T112 (YTF.AR.T112...) - Opcion 4");
+            int option = askInt(sc, "Ingrese la opcion [1-4]: ", 1, 4);
+
+            // 2) Sección
+            String section = askString(sc, "Ingrese la seccion (ej. " + sections.get(0) + "): ").trim();
+            if (!cfgFile.data.containsKey(section)) {
+                throw new IllegalArgumentException("La seccion [" + section + "] no existe en el INI.");
+            }
+            Config cfg = Config.from(cfgFile, section);
+
+            // 3) Nombre de archivo
+            String fileNameArg = null;
+            if (option == 3 || option == 4) {
+                // Para T120/T112, siempre se necesita {FILE}
+                fileNameArg = askDefaultOrCustom(sc, "¿Desea usar un nombre por defecto para {FILE}? (S/N) ",
+                        "MIARCHIVO", "Ingrese el nombre {FILE}: ");
+            } else {
+                // Para envio/reporte: puedes usar template del INI o ingresar uno
+                boolean usarTemplate = askYesNo(sc, "¿Desea seguir el patron del INI (fileNameTemplate) para FILE_NAME? (S/N) ");
+                if (!usarTemplate) {
+                    fileNameArg = askString(sc, "Ingrese FILE_NAME (cualquier longitud): ").trim().toUpperCase();
+                    if (fileNameArg.isEmpty()) fileNameArg = null; // si se arrepiente
+                }
+            }
+
+            // 4) Fecha
+            String date;
+            if (askYesNo(sc, "¿Usar la fecha de hoy? (S/N) ")) {
+                date = LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+            } else {
+                while (true) {
+                    date = askString(sc, "Ingrese DATE (AAAAMMDD): ").trim();
+                    if (validateDate(date)) break;
+                    System.out.println("Fecha invalida. Intente de nuevo.");
+                }
+            }
+
+            // 5) Reporte: parsear vs crudo
+            Boolean parseOverride = null;
+            if (option == 2) {
+                boolean parse = askYesNo(sc, "Para el reporte, ¿desea parsear (ordenar) el contenido? (S/N) ");
+                parseOverride = parse;
+            }
+
+            System.out.println("\nResumen:");
+            System.out.println("  Opcion: " + option);
+            System.out.println("  Seccion: " + section);
+            System.out.println("  FILE_NAME: " + (fileNameArg == null ? "<template INI>" : fileNameArg));
+            System.out.println("  DATE: " + date + (LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE).equals(date) ? " (hoy)" : ""));
+            if (option == 2) System.out.println("  Reporte (parsear): " + (parseOverride ? "SI" : "NO"));
+            System.out.println();
+
+            new Sender(cfg, option, fileNameArg, date, parseOverride).run();
+        }
+
+        private static int askInt(Scanner sc, String prompt, int min, int max) {
+            while (true) {
+                System.out.print(prompt);
+                String s = sc.nextLine().trim();
+                try {
+                    int v = Integer.parseInt(s);
+                    if (v < min || v > max) throw new NumberFormatException();
+                    return v;
+                } catch (NumberFormatException e) {
+                    System.out.println("Valor invalido. Ingrese un numero entre " + min + " y " + max + ".");
+                }
+            }
+        }
+        private static String askString(Scanner sc, String prompt) {
+            System.out.print(prompt);
+            return sc.nextLine();
+        }
+        private static boolean askYesNo(Scanner sc, String prompt) {
+            while (true) {
+                System.out.print(prompt);
+                String s = sc.nextLine().trim().toUpperCase(Locale.ROOT);
+                if (s.equals("S") || s.equals("SI") || s.equals("Y") || s.equals("YES")) return true;
+                if (s.equals("N") || s.equals("NO")) return false;
+                System.out.println("Responda S/N.");
+            }
+        }
+        private static String askDefaultOrCustom(Scanner sc, String question, String defVal, String customPrompt) {
+            if (askYesNo(sc, question)) {
+                System.out.println("Usando nombre por defecto: " + defVal);
+                return defVal;
+            }
+            return askString(sc, customPrompt).trim().toUpperCase();
+        }
     }
-    logger.info("Archivo escrito: " + fileName);
+
+    // -------------------------------- Config --------------------------------
+
+    static class Config {
+        final String host;
+        final int port;
+        final int connectTimeoutMs;
+        final int soTimeoutMs;
+        final int chunkSize;
+        final Path dataFilePath;
+        final Path historyFilePath;
+        final List<String> acceptedCodes;
+        final String alreadySentSubstring;
+        final String defaultFailCode;
+        final String dateOverride;   // opcional desde INI
+        final String nameTemplate;
+        final String fileNameTemplate;
+        final String reportEntity;   // para T120/T112
+        final String reportNameTemplate;
+        final boolean reportProcess;
+
+        private Config(String host, int port, int connectTimeoutMs, int soTimeoutMs, int chunkSize,
+                       Path dataFilePath, Path historyFilePath, List<String> acceptedCodes,
+                       String alreadySentSubstring, String defaultFailCode,
+                       String dateOverride,
+                       String nameTemplate, String fileNameTemplate,
+                       String reportEntity, String reportNameTemplate, boolean reportProcess) {
+            this.host = host;
+            this.port = port;
+            this.connectTimeoutMs = connectTimeoutMs;
+            this.soTimeoutMs = soTimeoutMs;
+            this.chunkSize = chunkSize;
+            this.dataFilePath = dataFilePath;
+            this.historyFilePath = historyFilePath;
+            this.acceptedCodes = acceptedCodes;
+            this.alreadySentSubstring = alreadySentSubstring;
+            this.defaultFailCode = defaultFailCode;
+            this.dateOverride = dateOverride;
+            this.nameTemplate = nameTemplate;
+            this.fileNameTemplate = fileNameTemplate;
+            this.reportEntity = reportEntity;
+            this.reportNameTemplate = reportNameTemplate;
+            this.reportProcess = reportProcess;
+        }
+
+        static Config from(IniFile ini, String section) {
+            Map<String,String> s = ini.section(section);
+            if (s == null) throw new IllegalArgumentException("No existe la seccion ["+section+"].");
+
+            String host = req(s, "host");
+            int port = parseInt(s.get("port"), 1, 65535, "port");
+            int connectTimeout = parseInt(s.getOrDefault("connectTimeoutMs","60000"), 1000, 300000, "connectTimeoutMs");
+            int soTimeout = parseInt(s.getOrDefault("soTimeoutMs","60000"), 1000, 300000, "soTimeoutMs");
+            int chunk = parseInt(s.getOrDefault("chunkSize","980"), 1, 65535, "chunkSize");
+
+            String dataFileStr = s.getOrDefault("dataFilePath", "MIPFILE_DATI");
+            String historyFileStr = s.getOrDefault("historyFilePath", "MIPFILE_HISTORY_R");
+
+            List<String> acceptedList = parseList(s.getOrDefault("acceptedCode","9980100"));
+            String already = s.getOrDefault("alreadySentSubstring","9288W");
+            String failDef = s.getOrDefault("defaultFailCode","9980101");
+
+            // YA NO se lee codePage del INI
+            String dateOverride = s.get("date");
+
+            String nameTemplate = s.getOrDefault("nameTemplate", "00401{file}{julian}");
+            String fileNameTemplate = s.get("fileNameTemplate");
+
+            String reportEntity = s.getOrDefault("report.entity", "E0002840");
+            String reportNameTemplate = s.getOrDefault("reportNameTemplate", "10101{file}{julian}");
+            String reportProcessStr   = s.getOrDefault("report.process", "Y");
+            boolean reportProcess     = reportProcessStr.trim().equalsIgnoreCase("Y");
+
+            Path dataPath = resolveAgainstCwd(dataFileStr);
+            Path histPath = resolveAgainstCwd(historyFileStr);
+
+            String trailer = pickTrailerCodeSeven(acceptedList);
+            if (trailer == null) {
+                throw new IllegalArgumentException("acceptedCode debe incluir al menos un valor de 7 caracteres para el trailer.");
+            }
+
+            logger.info("CWD (user.dir): " + Paths.get(System.getProperty("user.dir")).toAbsolutePath());
+            logger.info("dataFilePath   : " + dataPath.toAbsolutePath());
+            logger.info("historyFilePath: " + histPath.toAbsolutePath());
+
+            return new Config(host, port, connectTimeout, soTimeout, chunk,
+                              dataPath, histPath, acceptedList, already, failDef,
+                              dateOverride, nameTemplate, fileNameTemplate,
+                              reportEntity, reportNameTemplate, reportProcess);
+        }
+
+        private static Path resolveAgainstCwd(String p) {
+            Path path = Paths.get(p);
+            if (path.isAbsolute()) return path.normalize();
+            return Paths.get(System.getProperty("user.dir")).resolve(p).normalize();
+        }
+        private static String req(Map<String,String> m, String key) {
+            String v = m.get(key);
+            if (v == null || v.trim().isEmpty()) throw new IllegalArgumentException("Falta "+key);
+            return v.trim();
+        }
+        private static int parseInt(String s, int min, int max, String name) {
+            try {
+                int v = Integer.parseInt(s.trim());
+                if (v < min || v > max) throw new IllegalArgumentException(name+" fuera de rango ["+min+","+max+"]");
+                return v;
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException(name+" no numerico: "+s);
+            }
+        }
+        private static List<String> parseList(String csv) {
+            List<String> out = new ArrayList<>();
+            if (csv == null) return Collections.emptyList();
+            for (String p : csv.split(",")) {
+                String t = p.trim();
+                if (!t.isEmpty()) out.add(t);
+            }
+            return out.isEmpty() ? Collections.emptyList() : Collections.unmodifiableList(out);
+        }
+        String firstAcceptedCodeOrDefault() {
+            return acceptedCodes.isEmpty() ? defaultFailCode : acceptedCodes.get(0);
+        }
+        String trailerCodeSeven() {
+            String t = pickTrailerCodeSeven(acceptedCodes);
+            if (t == null) throw new IllegalArgumentException("acceptedCode debe incluir un valor de 7 caracteres para trailer.");
+            return t;
+        }
+        private static String pickTrailerCodeSeven(List<String> codes) {
+            if (codes == null) return null;
+            for (String c : codes) {
+                String t = (c == null ? "" : c.trim());
+                if (t.length() == 7) return t;
+            }
+            return null;
+        }
+    }
+
+    // ----------------------------- INI simple -----------------------------
+
+    static class IniFile {
+        private final Map<String, Map<String,String>> data = new LinkedHashMap<>();
+        private IniFile() {}
+        static IniFile load(Path path) throws IOException {
+            if (!Files.exists(path)) throw new NoSuchFileException(path.toString());
+            IniFile f = new IniFile();
+            Map<String,String> cur = null;
+            try (BufferedReader br = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    String ln = line.trim();
+                    if (ln.isEmpty() || ln.startsWith("#") || ln.startsWith(";")) continue;
+                    if (ln.startsWith("[") && ln.endsWith("]")) {
+                        String sec = ln.substring(1, ln.length()-1).trim();
+                        cur = f.data.computeIfAbsent(sec, k -> new LinkedHashMap<>());
+                    } else {
+                        int eq = ln.indexOf('=');
+                        if (eq < 0 || cur == null) continue;
+                        String k = ln.substring(0, eq).trim();
+                        String v = ln.substring(eq+1).trim();
+                        cur.put(k, v);
+                    }
+                }
+            }
+            return f;
+        }
+        Map<String,String> section(String name) { return data.get(name); }
+    }
+
+    // ------------------------------ Sender ------------------------------
+
+    static class Sender {
+        private final Config cfg;
+        private final int option;
+        private final String fileNameArg;         // puede ser null: usar template
+        private final String date;                // AAAAMMDD
+        private final Boolean reportProcessOverride; // null = usa INI; true/false = override
+
+        Sender(Config cfg, int option, String fileNameArg, String cliDateParam, Boolean reportProcessOverride) {
+            this.cfg = cfg;
+            this.option = option;
+            this.fileNameArg = (fileNameArg == null || fileNameArg.isEmpty()) ? null : fileNameArg.toUpperCase();
+            this.reportProcessOverride = reportProcessOverride;
+            this.date = (cliDateParam != null && validateDate(cliDateParam))
+                    ? cliDateParam
+                    : (cfg.dateOverride != null && validateDate(cfg.dateOverride)
+                        ? cfg.dateOverride
+                        : LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE));
+            logger.info("Fecha efectiva: " + this.date + (cliDateParam != null ? " (CLI/menú)" : (cfg.dateOverride != null ? " (INI)" : " (hoy)")));
+        }
+
+        void run() {
+            if (option == 1) runSend();
+            else if (option == 2) runReport();
+            else if (option == 3) runDownloadByNomenclature(120);
+            else if (option == 4) runDownloadByNomenclature(112);
+            else throw new IllegalArgumentException("OPCION invalida: " + option);
+        }
+
+        // --------------------------- Opcion 1: Envio ---------------------------
+
+        private void runSend() {
+            logger.info("=== OPCION 1: Envio ===");
+
+            validateEnvironmentForSend(cfg);
+
+            byte[] payload = readPayload(cfg.dataFilePath);
+            if (payload.length == 0) {
+                logger.warning("El archivo de datos esta vacio: " + cfg.dataFilePath);
+                createShippingHistory(cfg.defaultFailCode, "<NOFILE>", this.date, cfg.historyFilePath);
+                return;
+            }
+
+            List<byte[]> parts = split(payload, cfg.chunkSize);
+            logger.info("Partes a enviar: " + parts.size() + " (chunkSize=" + cfg.chunkSize + ")");
+
+            String effectiveFileName = (fileNameArg != null) ? fileNameArg
+                    : generateFileNameFromTemplate(cfg.fileNameTemplate, this.date);
+
+            if (effectiveFileName == null || effectiveFileName.isEmpty()) {
+                throw new IllegalArgumentException("No hay FILE_NAME: CLI/menú o fileNameTemplate requerido.");
+            }
+            logger.info("FILE_NAME efectivo: " + effectiveFileName);
+
+            String nameToSend = applyNameTemplate(cfg.nameTemplate, effectiveFileName, this.date);
+            logger.info("Nombre a enviar: " + nameToSend);
+
+            String finalStatus = cfg.defaultFailCode;
+            try (Socket sock = new Socket()) {
+                sock.connect(new InetSocketAddress(cfg.host, cfg.port), cfg.connectTimeoutMs);
+                sock.setSoTimeout(cfg.soTimeoutMs);
+                logger.info(String.format("Conectado a %s:%d (SO_TIMEOUT=%dms)", cfg.host, cfg.port, cfg.soTimeoutMs));
+
+                // Envio de nombre
+                writeNameFrame(sock, nameToSend, EBCDIC);
+
+                // Aprobacion
+                String resp = readResponse(sock, EBCDIC).trim();
+                logger.info("Respuesta aprobacion: [" + resp + "]");
+
+                if (!cfg.alreadySentSubstring.isEmpty() && resp.contains(cfg.alreadySentSubstring)) {
+                    logger.info("Servidor indica 'ya enviado'.");
+                    finalStatus = cfg.firstAcceptedCodeOrDefault();
+                } else if (matchesAny(resp, cfg.acceptedCodes)) {
+                    logger.info("*** Enviando Tramas... [CANT:" + parts.size() + "]");
+                    for (byte[] p : parts) {
+                        writeChunkFrame(sock, p, EBCDIC);
+                        logger.info("Enviando trama al MIP [OK]");
+                    }
+
+                    // Trailer 11B
+                    writeTrailerFrame(sock, parts.size() + 1, EBCDIC, cfg.trailerCodeSeven());
+
+                    // Confirmacion final
+                    logger.info("Esperando confirmacion final...");
+                    String resp2 = readResponse(sock, EBCDIC).trim();
+                    logger.info("Confirmacion final: [" + resp2 + "]");
+                    if (matchesAny(resp2, cfg.acceptedCodes)) {
+                        finalStatus = cfg.firstAcceptedCodeOrDefault();
+                        logger.info("RESULTADO DE ENVIO [OK]");
+                    } else {
+                        logger.warning("RESULTADO DE ENVIO [FAIL] (codigo final no coincide con acceptedCode)");
+                    }
+                } else {
+                    logger.warning("Nombre rechazado por el hub.");
+                }
+            } catch (UnknownHostException e) {
+                logger.severe("Host desconocido: " + e.getMessage());
+            } catch (SocketTimeoutException e) {
+                logger.severe("Timeout de socket: " + e.getMessage());
+            } catch (ConnectException e) {
+                logger.severe("No se pudo conectar a " + cfg.host + ":" + cfg.port + " - " + e.getMessage());
+            } catch (IOException e) {
+                logger.severe("IO de red fallo: " + e.getMessage());
+            } catch (Exception e) {
+                logger.severe("Error inesperado en envio: " + e.getMessage());
+            } finally {
+                createShippingHistory(finalStatus, effectiveFileName, this.date, cfg.historyFilePath);
+            }
+
+            logger.info("=== PROCESO FINALIZADO (OPCION 1) ===");
+        }
+
+        // --------------------------- Opcion 2: Reporte -------------------------
+
+        private void runReport() {
+            logger.info("=== OPCION 2: Reporte ===");
+
+            validateEnvironmentForReport();
+
+            String effectiveFileName = (fileNameArg != null) ? fileNameArg
+                    : generateFileNameFromTemplate(cfg.fileNameTemplate, this.date);
+
+            if (effectiveFileName == null || effectiveFileName.isEmpty()) {
+                throw new IllegalArgumentException("No hay FILE_NAME: CLI/menú o fileNameTemplate requerido.");
+            }
+            logger.info("FILE_NAME efectivo: " + effectiveFileName);
+
+            // Nombre base (ej. "10101{file}{julian}")
+            String nameBase = applyNameTemplate(cfg.reportNameTemplate, effectiveFileName, this.date);
+            logger.info("Nombre base de reporte: " + nameBase);
+
+            String acceptedFirst = cfg.firstAcceptedCodeOrDefault();
+            boolean found = false;
+
+            StringBuilder finalRaw = new StringBuilder(); // crudo sin corchetes
+            StringBuilder finalFmt = new StringBuilder(); // agregando [chunk]\n
+
+            try (Socket sock = new Socket()) {
+                logger.info("[IP:" + cfg.host + "][PTO:" + cfg.port + "]");
+                sock.connect(new InetSocketAddress(cfg.host, cfg.port), cfg.connectTimeoutMs);
+                sock.setSoTimeout(cfg.soTimeoutMs);
+                logger.info("Estado de conexion con el MIP: " + sock.isConnected());
+
+                for (int i = 1; i <= 99; i++) {
+                    String secStr = String.format("%02d", i);
+                    String queryName = nameBase + secStr;
+
+                    logger.info("*** Consultando archivo de respuesta al MIP: " + queryName);
+                    writeNameFrame(sock, queryName, EBCDIC);
+
+                    StringBuilder rawAcc = new StringBuilder();
+                    StringBuilder fmtAcc = new StringBuilder();
+
+                    boolean moreData = true;
+                    while (moreData) {
+                        String chunk = readLegacyBlock(sock, EBCDIC);
+                        fmtAcc.append('[').append(chunk).append("]\n");
+                        rawAcc.append(chunk);
+
+                        if (chunk.isEmpty() || containsAnyAcceptedPrefix(fmtAcc.toString(), cfg.acceptedCodes)) {
+                            moreData = false;
+                        }
+                    }
+
+                    if (containsAny(rawAcc.toString(), cfg.acceptedCodes)) {
+                        logger.info("Archivo encontrado [OK]");
+                        found = true;
+                        finalRaw.setLength(0);
+                        finalFmt.setLength(0);
+                        finalRaw.append(rawAcc);
+                        finalFmt.append(fmtAcc);
+                        break;
+                    } else {
+                        logger.info("Buscando...");
+                    }
+                }
+
+                if (found) {
+                    logger.info("*** Generando archivo de respuesta (Reporte)...");
+                    String dataToWrite;
+                    boolean process = (reportProcessOverride != null) ? reportProcessOverride : cfg.reportProcess;
+                    if (process) {
+                        try {
+                            dataToWrite = orderDetails(finalFmt.toString(), acceptedFirst);
+                        } catch (Exception ex) {
+                            logger.severe("Ocurrio un error al ordenar el contenido del archivo: " + ex.getMessage());
+                            dataToWrite = finalRaw.toString(); // fallback
+                        }
+                    } else {
+                        dataToWrite = finalRaw.toString();
+                    }
+
+                    writeDataToFile(this.date, dataToWrite, effectiveFileName);
+                    logger.info("*** Reporte generado: [OK]");
+                } else {
+                    logger.severe("*** Respuesta del MIP: Archivo no encontrado [FAIL]");
+                }
+            } catch (UnknownHostException e) {
+                logger.severe("Host desconocido: " + e.getMessage());
+            } catch (SocketTimeoutException e) {
+                logger.severe("Timeout de socket: " + e.getMessage());
+            } catch (ConnectException e) {
+                logger.severe("No se pudo conectar a " + cfg.host + ":" + cfg.port + " - " + e.getMessage());
+            } catch (IOException e) {
+                logger.severe("IO de red fallo: " + e.getMessage());
+            } catch (Exception e) {
+                logger.severe("Error inesperado en reporte: " + e.getMessage());
+            }
+
+            logger.info("=== PROCESO FINALIZADO (OPCION 2) ===");
+        }
+
+        // ---------------------- Opcion 3/4: Descarga T120/T112 -----------------
+
+        /**
+         * Opcion 3/4: Descarga por nomenclatura:
+         *   YTF.AR.T{tCode}.F.{ENTITY}.D{YYMMDD}.{FILE}.A001
+         *   - ENTITY: cfg.reportEntity (INI: report.entity, default E0002840)
+         *   - YYMMDD desde this.date (AAAAMMDD)
+         *   - FILE: fileNameArg (CLI/menú; requerido)
+         * Se guarda crudo (sin procesar) con el mismo nombre.
+         */
+        private void runDownloadByNomenclature(int tCode) {
+            logger.info("=== OPCION " + (tCode == 120 ? "3" : "4") + ": Descarga por nomenclatura T" + tCode + " ===");
+
+            if (fileNameArg == null || fileNameArg.trim().isEmpty()) {
+                throw new IllegalArgumentException("Debe proporcionar el nombre {FILE} para la nomenclatura.");
+            }
+            String nombre = fileNameArg.trim();
+
+            LocalDate d = LocalDate.parse(this.date, DateTimeFormatter.BASIC_ISO_DATE);
+            String yymmdd = String.format("%02d%02d%02d", d.getYear() % 100, d.getMonthValue(), d.getDayOfMonth());
+
+            String queryName = "YTF.AR.T" + tCode + ".F." + cfg.reportEntity + ".D" + yymmdd + "." + nombre + ".A001";
+            logger.info("Nombre de archivo a solicitar: " + queryName);
+
+            try (Socket sock = new Socket()) {
+                logger.info("[IP:" + cfg.host + "][PTO:" + cfg.port + "]");
+                sock.connect(new InetSocketAddress(cfg.host, cfg.port), cfg.connectTimeoutMs);
+                sock.setSoTimeout(cfg.soTimeoutMs);
+                logger.info("Estado de conexion con el MIP: " + sock.isConnected());
+
+                writeNameFrame(sock, queryName, EBCDIC);
+
+                StringBuilder rawAcc = new StringBuilder();
+                boolean moreData = true;
+                while (moreData) {
+                    String chunk = readLegacyBlock(sock, EBCDIC);
+                    rawAcc.append(chunk);
+                    if (chunk.isEmpty() || containsAnyAcceptedPrefix(rawAcc.toString(), cfg.acceptedCodes)) {
+                        moreData = false;
+                    }
+                }
+
+                if (containsAny(rawAcc.toString(), cfg.acceptedCodes)) {
+                    logger.info("Archivo encontrado [OK] -> guardando crudo");
+                    writeRawToNamedFile(queryName, rawAcc.toString());
+                    logger.info("*** Descarga completada: [OK]");
+                } else {
+                    logger.severe("*** Respuesta del MIP: Archivo no encontrado [FAIL]");
+                }
+            } catch (UnknownHostException e) {
+                logger.severe("Host desconocido: " + e.getMessage());
+            } catch (SocketTimeoutException e) {
+                logger.severe("Timeout de socket: " + e.getMessage());
+            } catch (ConnectException e) {
+                logger.severe("No se pudo conectar a " + cfg.host + ":" + cfg.port + " - " + e.getMessage());
+            } catch (IOException e) {
+                logger.severe("IO de red fallo: " + e.getMessage());
+            } catch (Exception e) {
+                logger.severe("Error inesperado en descarga por nomenclatura: " + e.getMessage());
+            }
+
+            logger.info("=== PROCESO FINALIZADO (OPCION " + (tCode == 120 ? "3" : "4") + ") ===");
+        }
+
+        // ----------------------------- Utilidades -----------------------------
+
+        private static boolean matchesAny(String value, List<String> options) {
+            if (options == null || options.isEmpty()) return false;
+            for (String o : options) if (value.equals(o)) return true;
+            return false;
+        }
+        private static boolean containsAny(String haystack, List<String> options) {
+            if (options == null || options.isEmpty()) return false;
+            for (String o : options) if (haystack.contains(o)) return true;
+            return false;
+        }
+        private static boolean containsAnyAcceptedPrefix(String haystack, List<String> options) {
+            if (options == null || options.isEmpty()) return false;
+            for (String o : options) {
+                String p = o.trim();
+                if (p.isEmpty()) continue;
+                String pref = (p.length() >= 6 ? p.substring(0, 6) : p);
+                if (haystack.contains(pref)) return true;
+            }
+            return false;
+        }
+
+        private static void writeTrailerFrame(Socket s, int count, Charset ebcdic, String trailerCode7) throws IOException {
+            if (trailerCode7 == null || trailerCode7.length() != 7) {
+                throw new IllegalArgumentException("El codigo de trailer debe tener 7 caracteres.");
+            }
+            byte[] prefix = trailerCode7.getBytes(ebcdic);
+            byte[] cnt = lengthToBytes(count, 4);
+            byte[] body = new byte[11];
+            System.arraycopy(prefix, 0, body, 0, 7);
+            System.arraycopy(cnt,    0, body, 7, 4);
+            writeFrameRaw(s, body);
+        }
+
+        private static String generateFileNameFromTemplate(String template, String yyyymmdd) {
+            if (template == null || template.trim().isEmpty()) {
+                throw new IllegalArgumentException("fileNameTemplate no definido en el INI.");
+            }
+            String base = template.trim();
+            LocalDate d = LocalDate.parse(yyyymmdd, DateTimeFormatter.BASIC_ISO_DATE);
+            String ddmm = String.format("%02d%02d", d.getDayOfMonth(), d.getMonthValue());
+
+            base = base.replaceAll("(?i)\\{ddmm\\}", ddmm);
+
+            if (base.matches("(?i).*\\{rand\\}.*")) {
+                String rand4 = String.format("%04d", new Random().nextInt(10000));
+                base = base.replaceAll("(?i)\\{rand\\}", rand4);
+            }
+
+            base = base.toUpperCase(Locale.ROOT);
+
+            if (base.length() != 9) {
+                throw new IllegalArgumentException("fileNameTemplate debe producir 9 caracteres. Obtenido '" + base + "' (" + base.length() + ")");
+            }
+            return base;
+        }
+
+        private static String applyNameTemplate(String template, String fileName, String yyyymmdd) {
+            LocalDate d = LocalDate.parse(yyyymmdd, DateTimeFormatter.BASIC_ISO_DATE);
+            String julian = String.format("%03d", d.getDayOfYear());
+            String yy = String.format("%02d", d.getYear() % 100);
+            String mm = String.format("%02d", d.getMonthValue());
+            String dd = String.format("%02d", d.getDayOfMonth());
+
+            String out = template;
+            out = out.replaceAll("(?i)\\{file\\}",     java.util.regex.Matcher.quoteReplacement(fileName));
+            out = out.replaceAll("(?i)\\{julian\\}",   julian);
+            out = out.replaceAll("(?i)\\{yyyymmdd\\}", yyyymmdd);
+            out = out.replaceAll("(?i)\\{yy\\}",       yy);
+            out = out.replaceAll("(?i)\\{mm\\}",       mm);
+            out = out.replaceAll("(?i)\\{dd\\}",       dd);
+            return out;
+        }
+
+        private static void validateEnvironmentForSend(Config cfg) {
+            File cwd = new File(System.getProperty("user.dir"));
+            logDirPerms("Directorio actual", cwd);
+            if (!cwd.canRead() || !cwd.canExecute()) {
+                throw new IllegalStateException("El directorio actual no tiene permisos suficientes (lectura y ejecucion).");
+            }
+
+            File dataFile = cfg.dataFilePath.toFile();
+            if (!dataFile.exists() || !dataFile.isFile()) {
+                throw new IllegalStateException("No existe el archivo de datos o no es regular: " + cfg.dataFilePath);
+            }
+            logger.info("Permisos del archivo de datos (" + dataFile.getName() + "):");
+            logger.info("Lectura: " + (dataFile.canRead() ? "Permitido" : "No permitido"));
+            logger.info("Escritura: " + (dataFile.canWrite() ? "Permitido" : "No permitido"));
+            if (!dataFile.canRead()) {
+                throw new IllegalStateException("No hay permisos de lectura sobre el archivo de datos: " + dataFile.getAbsolutePath());
+            }
+
+            File histFile = cfg.historyFilePath.toFile();
+            File histDir  = histFile.getAbsoluteFile().getParentFile();
+            if (histDir != null) {
+                logDirPerms("Directorio del historico", histDir);
+                if (!histDir.canWrite() || !histDir.canExecute()) {
+                    throw new IllegalStateException("El directorio del historico no permite escribir/ejecutar: " + histDir.getAbsolutePath());
+                }
+            }
+
+            try (FileChannel ignore = FileChannel.open(cfg.historyFilePath,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
+                // OK
+            } catch (IOException e) {
+                throw new IllegalStateException("No se puede crear/escribir en el historico: " + cfg.historyFilePath + " - " + e.getMessage(), e);
+            }
+        }
+
+        private static void validateEnvironmentForReport() {
+            File cwd = new File(System.getProperty("user.dir"));
+            logDirPerms("Directorio actual", cwd);
+            if (!cwd.canRead() || !cwd.canExecute() || !cwd.canWrite()) {
+                throw new IllegalStateException("El directorio actual no tiene permisos suficientes (lectura/ejecucion/escritura) para generar el reporte.");
+            }
+        }
+
+        private static void logDirPerms(String label, File dir) {
+            logger.info(label + " (" + dir.getAbsolutePath() + "):");
+            logger.info("Lectura: " + (dir.canRead() ? "Permitido" : "No permitido"));
+            logger.info("Escritura: " + (dir.canWrite() ? "Permitido" : "No permitido"));
+            logger.info("Ejecucion: " + (dir.canExecute() ? "Permitido" : "No permitido"));
+        }
+
+        private static byte[] readPayload(Path p) {
+            logger.info("Leyendo payload: " + p.toAbsolutePath());
+            try {
+                byte[] data = Files.readAllBytes(p);
+                logger.info("Tamano payload: " + data.length + " bytes");
+                return data;
+            } catch (AccessDeniedException e) {
+                throw new RuntimeException("Sin permisos para leer: " + p, e);
+            } catch (NoSuchFileException e) {
+                throw new RuntimeException("No existe el archivo: " + p, e);
+            } catch (IOException e) {
+                throw new RuntimeException("Error leyendo archivo: " + p + " - " + e.getMessage(), e);
+            }
+        }
+
+        private static List<byte[]> split(byte[] data, int chunkSize) {
+            List<byte[]> parts = new ArrayList<>();
+            int total = data.length;
+            for (int off = 0; off < total; off += chunkSize) {
+                int len = Math.min(chunkSize, total - off);
+                parts.add(Arrays.copyOfRange(data, off, off + len));
+            }
+            return parts;
+        }
+
+        private static byte[] lengthToBytes(int num, int byts) {
+            byte[] r = new byte[byts];
+            for (int i = byts - 1; i >= 0; --i) {
+                r[i] = (byte)(num & 0xFF);
+                num >>>= 8;
+            }
+            return r;
+        }
+
+        private static void writeNameFrame(Socket s, String text, Charset ebcdic) throws IOException {
+            byte[] body = text.getBytes(ebcdic);
+            writeFrameRaw(s, body);
+        }
+
+        private static void writeChunkFrame(Socket s, byte[] asciiChunk, Charset ebcdic) throws IOException {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream(1 + asciiChunk.length);
+            baos.write((byte) 'R');
+            baos.write(asciiChunk);
+            String asText = new String(baos.toByteArray(), StandardCharsets.US_ASCII);
+            byte[] body = asText.getBytes(ebcdic);
+            writeFrameRaw(s, body);
+        }
+
+        private static void writeFrameRaw(Socket s, byte[] body) throws IOException {
+            int len = body.length;
+            byte[] header = lengthToBytes(len, 2);
+            OutputStream os = s.getOutputStream();
+            os.write(header);
+            os.write(body);
+            os.flush();
+        }
+
+        private static String readResponse(Socket s, Charset ebcdic) throws IOException {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            InputStream is = s.getInputStream();
+            byte[] buf = new byte[1024];
+            int n;
+            while (true) {
+                try {
+                    n = is.read(buf);
+                    if (n == -1) break;
+                    baos.write(buf, 0, n);
+                    if (n < buf.length) break;
+                } catch (SocketTimeoutException te) {
+                    if (baos.size() == 0) throw te;
+                    break;
+                }
+            }
+            byte[] ebcdicBytes = baos.toByteArray();
+            return new String(ebcdicBytes, ebcdic);
+        }
+
+        private static String readLegacyBlock(Socket s, Charset ebcdic) throws IOException {
+            InputStream is = s.getInputStream();
+            byte[] buf = new byte[1024];
+            int n = is.read(buf, 0, 1024);
+            if (n <= 0) return "";
+            String decoded = new String(buf, 0, n, ebcdic);
+            StringBuilder out = new StringBuilder(decoded.length());
+            for (int i = 0; i < decoded.length(); i++) {
+                char c = decoded.charAt(i);
+                if (c >= ' ' && c <= '~') out.append(c);
+                else if (c == '\n') out.append('\n');
+            }
+            return out.toString();
+        }
+
+        // ------------------ Historico (solo Opcion 1) ----------------------
+
+        private static void createShippingHistory(String respCode, String fileName, String dateYYYYMMDD, Path historyPath) {
+            try {
+                monthlyRotateIfFirstDay(historyPath);
+                String record = formatHistory(respCode, fileName, dateYYYYMMDD, LocalDateTime.now());
+                prependLine(historyPath, record);
+                logger.info("Historico actualizado: " + historyPath);
+            } catch (Exception e) {
+                logger.severe("No se pudo actualizar el historico: " + e.getMessage());
+            }
+        }
+
+        private static void monthlyRotateIfFirstDay(Path historyPath) {
+            if (LocalDate.now().getDayOfMonth() == 1) {
+                try {
+                    Files.write(historyPath, new byte[0],
+                            StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                } catch (IOException e) {
+                    logger.warning("No se pudo rotar historico mensual: " + e.getMessage());
+                }
+            }
+        }
+
+        private static String formatHistory(String resp, String code, String fec, LocalDateTime now) {
+            String ts = now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+            return "[" + resp + "-" + code + "-" + fec + ": " + ts + "]";
+        }
+
+        private static void prependLine(Path path, String line) throws IOException {
+            List<String> lines = new ArrayList<>();
+            if (Files.exists(path)) {
+                try {
+                    lines = Files.readAllLines(path, StandardCharsets.UTF_8);
+                } catch (MalformedInputException mie) {
+                    lines = new ArrayList<>();
+                }
+            }
+            lines.add(0, line);
+            Files.write(path, String.join(System.lineSeparator(), lines).getBytes(StandardCharsets.UTF_8),
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+        }
+
+        // ------------------ Helpers de reporte (Opcion 2) ---------------------
+
+        private static void writeDataToFile(String dateYYYYMMDD, String data, String fileNameAnyLen) throws IOException {
+            logger.info("Parametro date: " + dateYYYYMMDD + " (" + dateYYYYMMDD.length() + ")");
+            if (!validateDate(dateYYYYMMDD)) {
+                logger.severe("Fecha ingresada no es valida: " + dateYYYYMMDD);
+                return;
+            }
+            final String newName = getNameFileReport(dateYYYYMMDD, fileNameAnyLen);
+            logger.info("Generacion de nombre de reporte es valido: " + (newName != null));
+            if (newName == null) {
+                logger.severe("Nombre de reporte no pudo generarse.");
+                return;
+            }
+            logger.info("Creando reporte...");
+            try (FileOutputStream reportFile = new FileOutputStream(newName);
+                 PrintStream ps = new PrintStream(reportFile, true, "UTF-8")) {
+                ps.print(data);
+            }
+            logger.info("Reporte: " + newName + "[GENERADO]");
+        }
+
+        private static String orderDetails(String dataMipDato, String allOkCode) {
+            String fixed = normalizeTHArtifact(dataMipDato);
+            String headers = extractHeaders(fixed);
+            String details = extractDetails(fixed, allOkCode);
+            return headers + details;
+        }
+
+        private static String extractHeaders(String data) {
+            String src = (data == null) ? "" : data;
+
+            String sansGt  = src.replace(">", "");
+            String first20 = sansGt.length() >= 20 ? sansGt.substring(0, 20)
+                                                   : String.format("%-20s", sansGt);
+            String header = first20 + "]\n";
+
+            int start12 = src.indexOf("12");
+            int startH  = src.indexOf("H0");
+            int start   = (start12 >= 0) ? start12 : (startH >= 0 ? startH : -1);
+
+            if (start < 0) return header;
+
+            int end16   = src.indexOf("16", start);
+            int endD0   = src.indexOf("D0", start);
+            int endBrkt = src.indexOf("]",  start);
+            int end = firstNonNegMin(end16, endD0, endBrkt);
+            if (end < 0) end = src.length();
+
+            return header + safeSub(src, start, end);
+        }
+
+        /**
+         * Detalle con prefijo D0 en línea nueva (no "16").
+         * Inserta un '\n' antes del primer D0, y separa con '\n' entre items.
+         */
+        private static String extractDetails(String data, String allOkCode) {
+            String src = (data == null) ? "" : data;
+
+            int start16 = src.indexOf("16");
+            int startD0 = src.indexOf("D0");
+            int start   = (start16 >= 0) ? start16 : (startD0 >= 0 ? startD0 : -1);
+            if (start < 0) return "";
+
+            String cleaned = safeSub(src, start, src.length()).replace("[","").replace("]\n","");
+
+            String[] detailsData = cleaned.split("D0", -1);
+            StringBuilder out = new StringBuilder();
+            out.append('\n'); // asegurar nueva línea para el primer D0
+
+            boolean first = true;
+            for (int i = 1; i < detailsData.length; i++) {
+                String seg = detailsData[i];
+
+                if (!first) out.append('\n');
+                first = false;
+
+                out.append("D0");
+
+                String head = seg.length() >= 57 ? seg.substring(0,57) : String.format("%-57s", seg);
+                String tail = seg.length()  > 57 ? seg.substring(57)   : "";
+
+                if (i == detailsData.length - 1) {
+                    if (tail.length() < 26) {
+                        String t = tail.trim();
+                        if (t.length() > 15) t = t.substring(0, 15);
+                        String codErrors = String.format("%26s", t);
+                        out.append(head).append(codErrors).append(allOkCode);
+                    } else {
+                        int okPos = seg.indexOf(allOkCode);
+                        if (okPos >= 0) {
+                            out.append(seg, 0, okPos + allOkCode.length());
+                        } else {
+                            out.append(seg, 0, Math.min(83, seg.length()));
+                        }
+                    }
+                    break;
+                }
+
+                out.append(seg, 0, Math.min(83, seg.length()));
+            }
+
+            return out.toString();
+        }
+
+        private static boolean validateDate(String date) {
+            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyyMMdd");
+            try {
+                LocalDate.parse(date, formatter);
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        private static String getNameFileReport(String dateYYYYMMDD, String fileNameAnyLen) {
+            final String description = "-Archivo de Cambio Confirmacion";
+            DateTimeFormatter inputFormatter = DateTimeFormatter.ofPattern("yyyyMMdd");
+            DateTimeFormatter outputFormatter = DateTimeFormatter.ofPattern("yyyyMMdd");
+
+            String prefix;
+            if (fileNameAnyLen == null || fileNameAnyLen.isEmpty()) {
+                prefix = "";
+            } else {
+                prefix = (fileNameAnyLen.length() >= 4) ? fileNameAnyLen.substring(0, 4) : fileNameAnyLen;
+            }
+            prefix = prefix + "-";
+
+            try {
+                LocalDate fecha = LocalDate.parse(dateYYYYMMDD, inputFormatter);
+                return prefix + fecha.format(outputFormatter) + description;
+            } catch (Exception e) {
+                logger.severe("Parametro date(" + dateYYYYMMDD + ") incorrecto.");
+                return null;
+            }
+        }
+
+        // -------------------- Helpers para robustez --------------------
+
+        private static String normalizeTHArtifact(String s) {
+            if (s == null) return "";
+            return s.replaceAll("(?m)^T(?=H)", "");
+        }
+        private static String safeSub(String s, int from, int to) {
+            if (s == null) return "";
+            int a = Math.max(0, Math.min(from, s.length()));
+            int b = Math.max(a, Math.min(to,   s.length()));
+            return s.substring(a, b);
+        }
+        private static int firstNonNegMin(int... idx) {
+            int best = -1;
+            for (int v : idx) if (v >= 0 && (best < 0 || v < best)) best = v;
+            return best;
+        }
+
+        // ------------------------- Guardado crudo -----------------------
+
+        private static void writeRawToNamedFile(String fileName, String data) throws IOException {
+            try (FileOutputStream fos = new FileOutputStream(fileName);
+                 PrintStream ps = new PrintStream(fos, true, "UTF-8")) {
+                ps.print(data);
+            }
+            logger.info("Archivo escrito: " + fileName);
+        }
+    }
 }
 
-5) INI (por sección)
-
-Añade en tu INI (ej. [MIP], [GCO]) la entidad fija si deseas otra:
-
-# Para opciones 3/4 (descarga por nomenclatura)
-report.entity=E0002840
-
-
-Si no la pones, el código usa E0002840 por defecto.
-
-Ejemplos de uso
-
-T120 (opción 3), nombre T184316, fecha 20250925:
-
-java McBatchSender 3 MIP T184316 20250925
-
-
-Buscará y descargará:
-
-YTF.AR.T120.F.E0002840.D250925.T184316.A001
-
-
-T112 (opción 4), nombre MIARCHIVO, fecha tomada del día:
-
-java McBatchSender 4 MIP MIARCHIVO
-
-
-Buscará:
-
-YTF.AR.T112.F.E0002840.D<yymmdd_de_hoy>.TMIARCHIVO.A001
