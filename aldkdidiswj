@@ -8,7 +8,7 @@
 //
 // Protocolo:
 //   - Cada trama: header de 2 bytes (longitud big-endian) + cuerpo en EBCDIC (interno Cp037).
-//   - Opcion 1 (envio): cada parte se envía con prefijo ASCII 'R' antes del cuerpo y luego
+//   - Opcion 1 (envio): cada parte se envia con prefijo ASCII 'R' antes del cuerpo y luego
 //     se convierte a EBCDIC. Trailer final: 11 bytes = EBCDIC(acceptedCode de 7 chars) + contador(4B).
 //
 // Flujo (resumen):
@@ -18,7 +18,7 @@
 //     3) Arma nombre con nameTemplate y hace handshake (acceptedCode / alreadySentSubstring).
 //     4) Envia tramas y trailer 11B, espera confirmacion final (acceptedCode), actualiza historico.
 //
-//   Opcion 2 (Reporte “MIP”):
+//   Opcion 2 (Reporte "MIP"):
 //     1) Valida permisos (CWD con escritura).
 //     2) Determina FILE_NAME (CLI o fileNameTemplate).
 //     3) Arma nombre base desde reportNameTemplate y consulta secuencias 01..99.
@@ -36,25 +36,25 @@
 //   - dataFilePath, historyFilePath
 //   - acceptedCode (lista separada por comas; uno de 7 chars se usa en trailer)
 //   - alreadySentSubstring, defaultFailCode
-//   - date (YYYYMMDD opcional para plantillas; ignorada si CLI/menú define fecha)
+//   - date (YYYYMMDD opcional para plantillas; ignorada si CLI/menu define fecha)
 //   - nameTemplate (p.ej. "00401{file}{julian}")
-//   - fileNameTemplate (si no pasas FILE_NAME en CLI/menú): literal, {rand}, {ddmm} -> 9 chars exactos
+//   - fileNameTemplate (si no pasas FILE_NAME en CLI/menu): literal, {rand}, {ddmm} -> 9 chars exactos
 //   - reportNameTemplate (p.ej. "10101{file}{julian}") para Opcion 2
 //   - report.process=Y|N (Y=procesa headers+details; N=escribe crudo)
 //   - report.entity=E0002840 (usada en opciones 3/4)
 //   *** NOTA: YA NO SE LEE "codePage" DEL INI (se usa Cp037 internamente). ***
 //
-// Uso (modo parámetros: obligatorio todo):
+// Uso (modo parametros: obligatorio todo):
 //   javac McBatchSender.java
 //   java McBatchSender <OPCION> <SECCION> <FILE_NAME> <DATE>  [-Dmcsender.config=/ruta/mcsender.ini]
 //
 //   - <OPCION>    : 1=Envio, 2=Reporte MIP, 3=Descarga T120, 4=Descarga T112
 //   - <SECCION>   : nombre de la seccion del INI (ej. MIP, GCO)
-//   - <FILE_NAME> : para 1/2: nombre lógico (cualquier longitud); si quieres usar template deja "" en modo menú
+//   - <FILE_NAME> : para 1/2: nombre logico (cualquier longitud); si quieres usar template deja "" en modo menu
 //                   para 3/4: componente {FILE} del nombre YTF.AR... (cualquier longitud)
 //   - <DATE>      : AAAAMMDD
 //
-// Uso (sin parámetros): menú interactivo para elegir opción/sección/nombre/fecha y parseo (opción 2).
+// Uso (sin parametros): menu interactivo para elegir opcion/seccion/nombre/fecha y parseo (opcion 2).
 //
 // Codigos de salida:
 //   0=OK | 1=error inesperado | 2=uso invalido | 3=INI no encontrado | 4=INI/argumento invalido
@@ -80,8 +80,8 @@ public class McBatchSender {
 
     /**
      * Punto de entrada.
-     * - Con 0 parámetros: muestra menú interactivo.
-     * - Con 4 parámetros: <OPCION> <SECCION> <FILE_NAME> <DATE> (formato fijo y requerido).
+     * - Con 0 parametros: muestra menu interactivo.
+     * - Con 4 parametros: <OPCION> <SECCION> <FILE_NAME> <DATE> (formato fijo y requerido).
      */
     public static void main(String[] args) {
         final String iniPath = System.getProperty("mcsender.config", "mcsender.ini");
@@ -158,6 +158,18 @@ public class McBatchSender {
         }
     }
 
+    // --- Util compartido ---
+    // Valida fecha AAAAMMDD (usada por main e Interactive)
+    private static boolean validateDate(String date) {
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyyMMdd");
+        try {
+            LocalDate.parse(date, formatter);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     // -------------------------------- Interactivo --------------------------------
 
     static class Interactive {
@@ -165,22 +177,22 @@ public class McBatchSender {
             Scanner sc = new Scanner(System.in);
 
             // Mostrar secciones disponibles
-            List<String> sections = new ArrayList<>(cfgFile.data.keySet());
+            List<String> sections = cfgFile.sectionNames();
             if (sections.isEmpty()) throw new IllegalArgumentException("El INI no contiene secciones.");
             System.out.println("\n=== McBatchSender (Modo Interactivo) ===");
             System.out.println("Secciones disponibles: " + String.join(", ", sections));
 
-            // 1) Opción
+            // 1) Opcion
             System.out.println("\nOpciones:");
-            System.out.println("  1) Envío (envía archivo de datos - Opcion 1)");
+            System.out.println("  1) Envio (envia archivo de datos - Opcion 1)");
             System.out.println("  2) Reporte MIP (consulta 10101... - Opcion 2)");
             System.out.println("  3) Descarga por nomenclatura T120 (YTF.AR.T120...) - Opcion 3");
             System.out.println("  4) Descarga por nomenclatura T112 (YTF.AR.T112...) - Opcion 4");
             int option = askInt(sc, "Ingrese la opcion [1-4]: ", 1, 4);
 
-            // 2) Sección
+            // 2) Seccion
             String section = askString(sc, "Ingrese la seccion (ej. " + sections.get(0) + "): ").trim();
-            if (!cfgFile.data.containsKey(section)) {
+            if (cfgFile.section(section) == null) {
                 throw new IllegalArgumentException("La seccion [" + section + "] no existe en el INI.");
             }
             Config cfg = Config.from(cfgFile, section);
@@ -429,6 +441,12 @@ public class McBatchSender {
             }
             return f;
         }
+
+        // Devuelve la lista de nombres de secciones en orden de aparicion
+        List<String> sectionNames() {
+            return new ArrayList<>(data.keySet());
+        }
+
         Map<String,String> section(String name) { return data.get(name); }
     }
 
@@ -451,7 +469,7 @@ public class McBatchSender {
                     : (cfg.dateOverride != null && validateDate(cfg.dateOverride)
                         ? cfg.dateOverride
                         : LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE));
-            logger.info("Fecha efectiva: " + this.date + (cliDateParam != null ? " (CLI/menú)" : (cfg.dateOverride != null ? " (INI)" : " (hoy)")));
+            logger.info("Fecha efectiva: " + this.date + (cliDateParam != null ? " (CLI/menu)" : (cfg.dateOverride != null ? " (INI)" : " (hoy)")));
         }
 
         void run() {
@@ -483,7 +501,7 @@ public class McBatchSender {
                     : generateFileNameFromTemplate(cfg.fileNameTemplate, this.date);
 
             if (effectiveFileName == null || effectiveFileName.isEmpty()) {
-                throw new IllegalArgumentException("No hay FILE_NAME: CLI/menú o fileNameTemplate requerido.");
+                throw new IllegalArgumentException("No hay FILE_NAME: CLI/menu o fileNameTemplate requerido.");
             }
             logger.info("FILE_NAME efectivo: " + effectiveFileName);
 
@@ -557,7 +575,7 @@ public class McBatchSender {
                     : generateFileNameFromTemplate(cfg.fileNameTemplate, this.date);
 
             if (effectiveFileName == null || effectiveFileName.isEmpty()) {
-                throw new IllegalArgumentException("No hay FILE_NAME: CLI/menú o fileNameTemplate requerido.");
+                throw new IllegalArgumentException("No hay FILE_NAME: CLI/menu o fileNameTemplate requerido.");
             }
             logger.info("FILE_NAME efectivo: " + effectiveFileName);
 
@@ -653,7 +671,7 @@ public class McBatchSender {
          *   YTF.AR.T{tCode}.F.{ENTITY}.D{YYMMDD}.{FILE}.A001
          *   - ENTITY: cfg.reportEntity (INI: report.entity, default E0002840)
          *   - YYMMDD desde this.date (AAAAMMDD)
-         *   - FILE: fileNameArg (CLI/menú; requerido)
+         *   - FILE: fileNameArg (CLI/menu; requerido)
          * Se guarda crudo (sin procesar) con el mismo nombre.
          */
         private void runDownloadByNomenclature(int tCode) {
@@ -1023,7 +1041,7 @@ public class McBatchSender {
         }
 
         /**
-         * Detalle con prefijo D0 en línea nueva (no "16").
+         * Detalle con prefijo D0 en linea nueva (no "16").
          * Inserta un '\n' antes del primer D0, y separa con '\n' entre items.
          */
         private static String extractDetails(String data, String allOkCode) {
@@ -1038,7 +1056,7 @@ public class McBatchSender {
 
             String[] detailsData = cleaned.split("D0", -1);
             StringBuilder out = new StringBuilder();
-            out.append('\n'); // asegurar nueva línea para el primer D0
+            out.append('\n'); // asegurar nueva linea para el primer D0
 
             boolean first = true;
             for (int i = 1; i < detailsData.length; i++) {
@@ -1107,7 +1125,7 @@ public class McBatchSender {
             }
         }
 
-        // -------------------- Helpers para robustez --------------------
+        // -------------------- Helpers NUEVOS para robustez --------------------
 
         private static String normalizeTHArtifact(String s) {
             if (s == null) return "";
@@ -1125,7 +1143,7 @@ public class McBatchSender {
             return best;
         }
 
-        // ------------------------- Guardado crudo -----------------------
+        // ------------------------- Guardado crudo (3/4) -----------------------
 
         private static void writeRawToNamedFile(String fileName, String data) throws IOException {
             try (FileOutputStream fos = new FileOutputStream(fileName);
@@ -1136,4 +1154,3 @@ public class McBatchSender {
         }
     }
 }
-
