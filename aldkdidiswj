@@ -536,14 +536,27 @@ public class McBatchSender {
                     }
                 }
 
-                if (containsAny(rawAcc.toString(), cfg.acceptedCodes)) {
-                    logger.info("-> Archivo encontrado [OK]. Guardando...");
+                // -- L ORIGINAL (ELIMINADA) --
+                // if (containsAny(rawAcc.toString(), cfg.acceptedCodes)) {
+                //     logger.info("-> Archivo encontrado [OK]. Guardando...");
+                //     writeRawToNamedFile(fullName, rawAcc.toString());
+                //     return true;
+                // } else {
+                //     logger.info("-> Archivo no encontrado o respuesta invalida.");
+                //     return false;
+                // }
+                
+                // --  NUEVA 
+                // Ahora, simplemente verificamos si recibimos CUALQUIER dato.
+                if (rawAcc.length() > 0) {
+                    logger.info("-> Respuesta recibida del servidor (" + rawAcc.length() + " caracteres). Guardando sin validar el código.");
                     writeRawToNamedFile(fullName, rawAcc.toString());
-                    return true;
+                    return true; // Se considera "éxito" si se recibió y guardó algo.
                 } else {
-                    logger.info("-> Archivo no encontrado o respuesta invalida.");
+                    logger.info("-> No se recibio ninguna respuesta del servidor.");
                     return false;
                 }
+
             } catch (Exception e) {
                 logger.warning("Error al intentar descargar " + fullName + ": " + e.getMessage());
                 return false;
