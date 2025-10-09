@@ -2,7 +2,7 @@
 // McBatchSender
 //
 // Proposito:
-//   Envia un archivo por TCP (Opcion 1) y genera/descarga reportes (Opciones 2, 3 y 4)
+//   Envia un archivo por TCP (Opcion 1) y genera/descarga reportes (Opciones 2, 3, 4 y 5)
 //   con un menu interactivo cuando se ejecuta sin parametros.
 //
 // Protocolo:
@@ -24,6 +24,9 @@
 //     - Descarga crudo del nombre:
 //       YTF.AR.T{120|112}.F.E0002840.D{YYMMDD}.T{HHMMSS}.A001
 //
+//   Opcion 5 (Descarga por nombre completo):
+//     - Envia exactamente el nombre completo que indiques y guarda crudo.
+//
 // Parametrizacion (INI):
 //   - host, port, connectTimeoutMs, soTimeoutMs, chunkSize
 //   - dataFilePath, historyFilePath
@@ -38,9 +41,8 @@
 //
 // Uso por parametros:
 //   - Opcion 1/2: java McBatchSender <OPC> <SECCION> <FILE_NAME> <DATE>
-//   - Opcion 3/4 (atajo): java McBatchSender <OPC> <HHMMSS> <DATE>  (usa seccion MIP)
-//   - Opcion 3/4 (completo): java McBatchSender <OPC> <SECCION> <HHMMSS> <DATE>
-//   Donde DATE=AAAAMMDD y HHMMSS=hora minuto segundo (6 digitos).
+//   - Opcion 3/4: java McBatchSender <OPC> <SECCION> <HHMMSS> <DATE>
+//   - Opcion 5  : java McBatchSender 5 <SECCION> <FULL_NAME>
 //
 // Uso sin parametros: menu interactivo.
 //
@@ -75,7 +77,6 @@ public class McBatchSender {
         DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyyMMdd");
         try { LocalDate.parse(date, formatter); return true; } catch (Exception e) { return false; }
     }
-
     // Valida HHMMSS
     private static boolean validateHHMMSS(String hhmmss) {
         if (hhmmss == null || !hhmmss.matches("\\d{6}")) return false;
@@ -90,7 +91,8 @@ public class McBatchSender {
      * - Sin argumentos: modo interactivo.
      * - Con argumentos:
      *     Opcion 1/2: <OPC> <SECCION> <FILE_NAME> <DATE>
-     *     Opcion 3/4 (completo): <OPC> <SECCION> <HHMMSS> <DATE>
+     *     Opcion 3/4: <OPC> <SECCION> <HHMMSS> <DATE>
+     *     Opcion 5  : 5 <SECCION> <FULL_NAME>
      */
     public static void main(String[] args) {
         final String iniPath = System.getProperty("mcsender.config", "mcsender.ini");
@@ -116,53 +118,58 @@ public class McBatchSender {
         final int option;
         try { option = Integer.parseInt(optionStr); }
         catch (NumberFormatException nfe) {
-            System.err.println("OPCION debe ser 1, 2, 3 o 4. Valor: '" + optionStr + "'");
+            System.err.println("OPCION debe ser 1, 2, 3, 4 o 5. Valor: '" + optionStr + "'");
             System.exit(4); return;
         }
-        if (option < 1 || option > 4) {
-            System.err.println("OPCION invalida. Use 1, 2, 3 o 4.");
+        if (option < 1 || option > 5) {
+            System.err.println("OPCION invalida. Use 1, 2, 3, 4 o 5.");
             System.exit(4);
         }
 
         boolean isTxx = (option == 3 || option == 4);
+        boolean isExact = (option == 5);
 
         String section;
-        String nameOrTime;   // para 1/2 = FILE_NAME; para 3/4 = HHMMSS
+        String nameParam;   // 1/2 = FILE_NAME; 3/4 = HHMMSS; 5 = FULL_NAME
         String date;
 
-        if (!isTxx) {
-            // Opcion 1/2: requiere 4 args
+        if (option == 1 || option == 2) {
             if (args.length != 4) {
                 System.err.println("Uso Opcion 1/2: java McBatchSender <OPC> <SECCION> <FILE_NAME> <DATE>");
                 System.exit(2);
             }
             section = args[1].trim();
-            nameOrTime = args[2].trim().toUpperCase();
+            nameParam = args[2].trim().toUpperCase();
             date = args[3].trim();
             if (!validateDate(date)) {
                 System.err.println("DATE debe ser AAAAMMDD. Valor: '" + date + "'");
                 System.exit(4);
             }
-        } else {
-
-            // Opcion 3/4: formato completo: <OPC> <SECCION> <HHMMSS> <DATE>
+        } else if (isTxx) {
             if (args.length != 4) {
                 System.err.println("Uso Opcion 3/4: java McBatchSender <OPC> <SECCION> <HHMMSS> <DATE>");
                 System.exit(2);
             }
             section   = args[1].trim();
-            nameOrTime = args[2].trim();
+            nameParam = args[2].trim();
             date      = args[3].trim();
-
-            if (!validateHHMMSS(nameOrTime)) {
-                System.err.println("HHMMSS invalido. Debe ser 6 digitos (00-23,00-59,00-59). Valor: '" + nameOrTime + "'");
+            if (!validateHHMMSS(nameParam)) {
+                System.err.println("HHMMSS invalido. Debe ser 6 digitos (00-23,00-59,00-59). Valor: '" + nameParam + "'");
                 System.exit(4);
             }
             if (!validateDate(date)) {
                 System.err.println("DATE debe ser AAAAMMDD. Valor: '" + date + "'");
                 System.exit(4);
             }
-
+        } else {
+            // Opcion 5
+            if (args.length != 3) {
+                System.err.println("Uso Opcion 5: java McBatchSender 5 <SECCION> <FULL_NAME>");
+                System.exit(2);
+            }
+            section   = args[1].trim();
+            nameParam = args[2].trim(); // no se toca (puede tener puntos, guiones, etc.)
+            date      = LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE); // no se usa, pero queda seteada
         }
 
         try {
@@ -177,11 +184,9 @@ public class McBatchSender {
             logger.info("acceptedCodes: " + cfg.acceptedCodes);
             logger.info("trailerCode (7 chars): " + cfg.trailerCodeSeven());
             logger.info("reportNameTemplate: " + cfg.reportNameTemplate + " | report.process=" + (cfg.reportProcess ? "Y" : "N"));
-            logger.info("DATE: " + date);
-            logger.info((isTxx ? "HHMMSS" : "FILE_NAME") + ": " + nameOrTime);
 
-            Boolean parseOverride = null; // solo aplica a opcion 2 si se usara interactivo
-            new Sender(cfg, option, (isTxx ? nameOrTime : nameOrTime), date, parseOverride).run();
+            Boolean parseOverride = null;
+            new Sender(cfg, option, nameParam, date, parseOverride).run();
             System.exit(0);
         } catch (NoSuchFileException e) {
             System.err.println("No se encontro el archivo de configuracion: " + e.getFile());
@@ -213,7 +218,8 @@ public class McBatchSender {
             System.out.println("  2) Reporte MIP (consulta 10101...)");
             System.out.println("  3) Descarga T120 (YTF.AR.T120.F.E0002840.DYYMMDD.THHMMSS.A001)");
             System.out.println("  4) Descarga T112 (YTF.AR.T112.F.E0002840.DYYMMDD.THHMMSS.A001)");
-            int option = askInt(sc, "Ingrese la opcion [1-4]: ", 1, 4);
+            System.out.println("  5) Descarga por nombre completo (envia el nombre tal cual)");
+            int option = askInt(sc, "Ingrese la opcion [1-5]: ", 1, 5);
 
             // 2) Seccion
             String section = askString(sc, "Ingrese la seccion (ej. " + sections.get(0) + "): ").trim();
@@ -224,10 +230,10 @@ public class McBatchSender {
 
             String fileNameArg = null; // para 1/2
             String hhmmss = null;      // para 3/4
+            String fullName = null;     // para 5
             String date;
 
             if (option == 1 || option == 2) {
-                // Mostrar patron y ejemplo del template
                 String tpl = cfg.fileNameTemplate;
                 String hoy = LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE);
                 String ejemplo = "<no disponible>";
@@ -238,29 +244,32 @@ public class McBatchSender {
                 System.out.println("\nPatron del nombre por defecto (fileNameTemplate): " + tpl);
                 System.out.println("Ejemplo (hoy " + hoy + "): " + ejemplo);
 
-                // Elegir si usar template o ingresar nombre
                 boolean usarTemplate = askYesNo(sc, "Desea usar el nombre por defecto segun el patron? (S/N) ");
                 if (!usarTemplate) {
                     fileNameArg = askString(sc, "Ingrese FILE_NAME (cualquier longitud): ").trim().toUpperCase();
                     if (fileNameArg.isEmpty()) fileNameArg = null;
                 }
-            } else {
-                // Opcion 3/4: pedir HHMMSS
+            } else if (option == 3 || option == 4) {
                 while (true) {
                     hhmmss = askString(sc, "Ingrese HHMMSS (6 digitos): ").trim();
                     if (validateHHMMSS(hhmmss)) break;
                     System.out.println("HHMMSS invalido. Intente de nuevo.");
                 }
+            } else {
+                fullName = askString(sc, "Ingrese el nombre completo a consultar (tal cual): ").trim();
+                if (fullName.isEmpty()) throw new IllegalArgumentException("Nombre completo vacio.");
             }
 
-            // Fecha
-            while (true) {
-                date = askString(sc, "Ingrese DATE (AAAAMMDD): ").trim();
-                if (validateDate(date)) break;
-                System.out.println("Fecha invalida. Intente de nuevo.");
+            if (option == 1 || option == 2 || option == 3 || option == 4) {
+                while (true) {
+                    date = askString(sc, "Ingrese DATE (AAAAMMDD): ").trim();
+                    if (validateDate(date)) break;
+                    System.out.println("Fecha invalida. Intente de nuevo.");
+                }
+            } else {
+                date = LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE); // no se usa en 5
             }
 
-            // Reporte: parsear vs crudo
             Boolean parseOverride = null;
             if (option == 2) {
                 boolean parse = askYesNo(sc, "Para el reporte, desea parsear (ordenar) el contenido? (S/N) ");
@@ -274,13 +283,19 @@ public class McBatchSender {
                 System.out.println("  FILE_NAME: " + (fileNameArg == null ? "<template INI>" : fileNameArg));
             if (option == 3 || option == 4)
                 System.out.println("  HHMMSS: " + hhmmss);
-            System.out.println("  DATE: " + date);
+            if (option == 5)
+                System.out.println("  FULL_NAME: " + fullName);
+            if (option != 5)
+                System.out.println("  DATE: " + date);
             if (option == 2) System.out.println("  Reporte (parsear): " + (parseOverride ? "SI" : "NO"));
             System.out.println();
 
-            // Pasar hhmmss por fileNameArg para reutilizar estructura (solo 3/4)
-            String nameOrTime = (option == 3 || option == 4) ? hhmmss : fileNameArg;
-            new Sender(cfg, option, nameOrTime, date, parseOverride).run();
+            String nameParam;
+            if (option == 3 || option == 4) nameParam = hhmmss;
+            else if (option == 5)          nameParam = fullName;
+            else                           nameParam = fileNameArg;
+
+            new Sender(cfg, option, nameParam, date, parseOverride).run();
         }
 
         private static int askInt(Scanner sc, String prompt, int min, int max) {
@@ -475,15 +490,15 @@ public class McBatchSender {
     static class Sender {
         private final Config cfg;
         private final int option;
-        private final String fileNameOrHHMMSS;      // para 1/2: FILE_NAME; para 3/4: HHMMSS
-        private final String date;                  // AAAAMMDD
+        private final String fileNameOrParam;       // 1/2: FILE_NAME; 3/4: HHMMSS; 5: FULL_NAME
+        private final String date;                  // AAAAMMDD (no usado en 5)
         private final Boolean reportProcessOverride;
 
-        Sender(Config cfg, int option, String fileNameOrHHMMSS, String cliDateParam, Boolean reportProcessOverride) {
+        Sender(Config cfg, int option, String fileNameOrParam, String cliDateParam, Boolean reportProcessOverride) {
             this.cfg = cfg;
             this.option = option;
-            this.fileNameOrHHMMSS = (fileNameOrHHMMSS == null || fileNameOrHHMMSS.isEmpty())
-                    ? null : fileNameOrHHMMSS.toUpperCase();
+            this.fileNameOrParam = (fileNameOrParam == null || fileNameOrParam.isEmpty())
+                    ? null : fileNameOrParam.toUpperCase();
             this.reportProcessOverride = reportProcessOverride;
             this.date = (cliDateParam != null && validateDate(cliDateParam))
                     ? cliDateParam
@@ -498,6 +513,7 @@ public class McBatchSender {
             else if (option == 2) runReport();
             else if (option == 3) runDownloadByNomenclature(120);
             else if (option == 4) runDownloadByNomenclature(112);
+            else if (option == 5) runDownloadByExactName();
             else throw new IllegalArgumentException("OPCION invalida: " + option);
         }
 
@@ -518,7 +534,7 @@ public class McBatchSender {
             List<byte[]> parts = split(payload, cfg.chunkSize);
             logger.info("Partes a enviar: " + parts.size() + " (chunkSize=" + cfg.chunkSize + ")");
 
-            String effectiveFileName = (fileNameOrHHMMSS != null) ? fileNameOrHHMMSS
+            String effectiveFileName = (fileNameOrParam != null) ? fileNameOrParam
                     : generateFileNameFromTemplate(cfg.fileNameTemplate, this.date);
 
             if (effectiveFileName == null || effectiveFileName.isEmpty()) {
@@ -584,7 +600,7 @@ public class McBatchSender {
 
             validateEnvironmentForReport();
 
-            String effectiveFileName = (fileNameOrHHMMSS != null) ? fileNameOrHHMMSS
+            String effectiveFileName = (fileNameOrParam != null) ? fileNameOrParam
                     : generateFileNameFromTemplate(cfg.fileNameTemplate, this.date);
 
             if (effectiveFileName == null || effectiveFileName.isEmpty()) {
@@ -670,18 +686,13 @@ public class McBatchSender {
 
         // ---------------------- Opcion 3/4: Descarga T120/T112 -----------------
 
-        /**
-         * Descarga por nomenclatura fija:
-         *   YTF.AR.T{tCode}.F.E0002840.D{YYMMDD}.T{HHMMSS}.A001
-         * Se guarda crudo con ese mismo nombre.
-         */
         private void runDownloadByNomenclature(int tCode) {
             logger.info("=== OPCION " + (tCode == 120 ? "3" : "4") + ": Descarga T" + tCode + " ===");
 
-            if (fileNameOrHHMMSS == null || !validateHHMMSS(fileNameOrHHMMSS)) {
+            if (fileNameOrParam == null || !validateHHMMSS(fileNameOrParam)) {
                 throw new IllegalArgumentException("HHMMSS invalido o ausente.");
             }
-            String hhmmss = fileNameOrHHMMSS;
+            String hhmmss = fileNameOrParam;
 
             LocalDate d = LocalDate.parse(this.date, DateTimeFormatter.BASIC_ISO_DATE);
             String yymmdd = String.format("%02d%02d%02d", d.getYear() % 100, d.getMonthValue(), d.getDayOfMonth());
@@ -719,6 +730,50 @@ public class McBatchSender {
             }
 
             logger.info("=== FIN OPCION " + (tCode == 120 ? "3" : "4") + " ===");
+        }
+
+        // ---------------------- Opcion 5: Descarga por nombre completo --------
+
+        private void runDownloadByExactName() {
+            logger.info("=== OPCION 5: Descarga por nombre completo ===");
+
+            if (fileNameOrParam == null || fileNameOrParam.trim().isEmpty()) {
+                throw new IllegalArgumentException("Nombre completo vacio.");
+            }
+            String fullName = fileNameOrParam.trim(); // no forzar upper: lo envias tal cual lo indiques
+
+            logger.info("Nombre a solicitar: " + fullName);
+
+            try (Socket sock = new Socket()) {
+                logger.info("[IP:" + cfg.host + "][PTO:" + cfg.port + "]");
+                sock.connect(new InetSocketAddress(cfg.host, cfg.port), cfg.connectTimeoutMs);
+                sock.setSoTimeout(cfg.soTimeoutMs);
+                logger.info("Estado de conexion con el MIP: " + sock.isConnected());
+
+                writeNameFrame(sock, fullName, EBCDIC);
+
+                StringBuilder rawAcc = new StringBuilder();
+                boolean moreData = true;
+                while (moreData) {
+                    String chunk = readLegacyBlock(sock, EBCDIC);
+                    rawAcc.append(chunk);
+                    if (chunk.isEmpty() || containsAnyAcceptedPrefix(rawAcc.toString(), cfg.acceptedCodes)) {
+                        moreData = false;
+                    }
+                }
+
+                if (containsAny(rawAcc.toString(), cfg.acceptedCodes)) {
+                    logger.info("Archivo encontrado [OK] -> guardando crudo");
+                    writeRawToNamedFile(fullName, rawAcc.toString());
+                    logger.info("*** Descarga completada [OK]");
+                } else {
+                    logger.severe("*** Archivo no encontrado [FAIL]");
+                }
+            } catch (Exception e) {
+                logger.severe("Error en descarga por nombre completo: " + e.getMessage());
+            }
+
+            logger.info("=== FIN OPCION 5 ===");
         }
 
         // ----------------------------- Utilidades -----------------------------
@@ -896,11 +951,6 @@ public class McBatchSender {
             os.flush();
         }
 
-        // Lee una respuesta del socket y la decodifica desde EBCDIC.
-        // Lee hasta que:
-        //  - read() devuelve -1, o
-        //  - la ultima lectura es menor que el tamano del buffer, o
-        //  - hay timeout: si ya hay datos acumulados, devuelve; si no, relanza.
         private static String readResponse(Socket s, Charset ebcdic) throws IOException {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             InputStream is = s.getInputStream();
@@ -912,8 +962,8 @@ public class McBatchSender {
                     baos.write(buf, 0, n);
                     if (n < buf.length) break;
                 } catch (SocketTimeoutException te) {
-                    if (baos.size() == 0) throw te; // si no llego nada, propaga timeout
-                    break;                           // si ya hay datos, corta y devuelve
+                    if (baos.size() == 0) throw te;
+                    break;
                 }
             }
             byte[] ebcdicBytes = baos.toByteArray();
@@ -1119,7 +1169,7 @@ public class McBatchSender {
             return best;
         }
 
-        // ------------------------- Guardado crudo (3/4) -----------------------
+        // ------------------------- Guardado crudo (3/4/5) ---------------------
 
         private static void writeRawToNamedFile(String fileName, String data) throws IOException {
             try (FileOutputStream fos = new FileOutputStream(fileName);
@@ -1130,4 +1180,3 @@ public class McBatchSender {
         }
     }
 }
-
