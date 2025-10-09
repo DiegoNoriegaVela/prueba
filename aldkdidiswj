@@ -929,7 +929,12 @@ public class McBatchSender {
         }
 
         private static void writeNameFrame(Socket s, String text, Charset ebcdic) throws IOException {
-            byte[] body = text.getBytes(ebcdic);
+            // ORIGINAL
+            // byte[] body = text.getBytes(ebcdic);
+
+            //NUEVA:
+            byte[] body = translateStringToEbcdicCustom(text); 
+
             writeFrameRaw(s, body);
         }
 
@@ -975,7 +980,8 @@ public class McBatchSender {
             byte[] buf = new byte[1024];
             int n = is.read(buf, 0, 1024);
             if (n <= 0) return "";
-            String decoded = new String(buf, 0, n, ebcdic);
+            //String decoded = new String(buf, 0, n, ebcdic);
+            String decoded = translateEbcdicToStringCustom(buf, n);
             StringBuilder out = new StringBuilder(decoded.length());
             for (int i = 0; i < decoded.length(); i++) {
                 char c = decoded.charAt(i);
@@ -1177,6 +1183,25 @@ public class McBatchSender {
                 ps.print(data);
             }
             logger.info("Archivo escrito: " + fileName);
+        }
+
+        private static byte[] translateStringToEbcdicCustom(String text) {
+            byte[] originalBytes = text.getBytes(StandardCharsets.US_ASCII);
+            byte[] ebcdicBytes = new byte[originalBytes.length];
+            for (int i = 0; i < originalBytes.length; i++) {
+                ebcdicBytes[i] = (byte) translateByte("toEBC", originalBytes[i]);
+            }
+            return ebcdicBytes;
+        }
+
+        private static String translateEbcdicToStringCustom(byte[] ebcdicBytes, int length) {
+            StringBuilder asciiString = new StringBuilder();
+            for (int i = 0; i < length; i++) {
+                int ebcdicChar = ebcdicBytes[i] & 0xFF; // Asegurarse de que es un valor positivo
+                char asciiChar = (char) translateByte("toASC", ebcdicChar);
+                asciiString.append(asciiChar);
+            }
+            return asciiString.toString();
         }
     }
 }
