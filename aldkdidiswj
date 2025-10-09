@@ -24,8 +24,9 @@
 //     - Descarga crudo del nombre:
 //       YTF.AR.T{120|112}.F.E0002840.D{YYMMDD}.T{HHMMSS}.A001
 //
-//   Opcion 5 (Descarga por nombre completo):
-//     - Envia exactamente el nombre completo que indiques y guarda crudo.
+//   Opcion 5 (Descarga por nombre completo - MANUAL):
+//     - NO usa INI. Requiere IP, PUERTO y NOMBRE COMPLETO por parametros o por submenu.
+//       Envia exactamente el nombre completo que indiques y guarda crudo.
 //
 // Parametrizacion (INI):
 //   - host, port, connectTimeoutMs, soTimeoutMs, chunkSize
@@ -42,7 +43,7 @@
 // Uso por parametros:
 //   - Opcion 1/2: java McBatchSender <OPC> <SECCION> <FILE_NAME> <DATE>
 //   - Opcion 3/4: java McBatchSender <OPC> <SECCION> <HHMMSS> <DATE>
-//   - Opcion 5  : java McBatchSender 5 <SECCION> <FULL_NAME>
+//   - Opcion 5  : java McBatchSender 5 <IP> <PUERTO> <FULL_NAME>
 //
 // Uso sin parametros: menu interactivo.
 //
@@ -69,6 +70,10 @@ public class McBatchSender {
     private static final Charset EBCDIC = Charset.forName("Cp037");
     // Entidad fija para opciones 3/4 (segun pedido)
     private static final String FIXED_ENTITY_Txx = "E0002840";
+    // Defaults para opcion 5 (manual)
+    private static final int DEFAULT_CONNECT_TIMEOUT_MS = 60000;
+    private static final int DEFAULT_SO_TIMEOUT_MS = 60000;
+    private static final List<String> DEFAULT_ACCEPTED_CODES = Collections.singletonList("9980100");
 
     // -------- Util compartido --------
 
@@ -92,7 +97,7 @@ public class McBatchSender {
      * - Con argumentos:
      *     Opcion 1/2: <OPC> <SECCION> <FILE_NAME> <DATE>
      *     Opcion 3/4: <OPC> <SECCION> <HHMMSS> <DATE>
-     *     Opcion 5  : 5 <SECCION> <FULL_NAME>
+     *     Opcion 5  : 5 <IP> <PUERTO> <FULL_NAME>
      */
     public static void main(String[] args) {
         final String iniPath = System.getProperty("mcsender.config", "mcsender.ini");
@@ -101,12 +106,15 @@ public class McBatchSender {
         if (args.length == 0) {
             // Interactivo
             try {
-                IniFile cfgFile = IniFile.load(ini);
+                IniFile cfgFile = null;
+                try {
+                    cfgFile = IniFile.load(ini);
+                } catch (NoSuchFileException nf) {
+                    // Si no existe INI, el modo interactivo seguira permitiendo la Opcion 5
+                    cfgFile = new IniFile(); // vacio
+                }
                 Interactive.runInteractive(cfgFile);
                 System.exit(0);
-            } catch (NoSuchFileException e) {
-                System.err.println("No se encontro el archivo de configuracion: " + e.getFile());
-                System.exit(3);
             } catch (Exception e) {
                 System.err.println("Error inesperado en modo interactivo: " + e.getMessage());
                 System.exit(1);
@@ -127,11 +135,13 @@ public class McBatchSender {
         }
 
         boolean isTxx = (option == 3 || option == 4);
-        boolean isExact = (option == 5);
+        boolean isManual = (option == 5);
 
-        String section;
-        String nameParam;   // 1/2 = FILE_NAME; 3/4 = HHMMSS; 5 = FULL_NAME
+        String section = null;
+        String nameParam;       // 1/2 = FILE_NAME; 3/4 = HHMMSS; 5 = FULL_NAME
         String date;
+        String manualHost = null; // solo opcion 5
+        Integer manualPort = null;
 
         if (option == 1 || option == 2) {
             if (args.length != 4) {
@@ -162,31 +172,45 @@ public class McBatchSender {
                 System.exit(4);
             }
         } else {
-            // Opcion 5
-            if (args.length != 3) {
-                System.err.println("Uso Opcion 5: java McBatchSender 5 <SECCION> <FULL_NAME>");
+            // Opcion 5 MANUAL: 5 <IP> <PUERTO> <FULL_NAME>
+            if (args.length != 4) {
+                System.err.println("Uso Opcion 5: java McBatchSender 5 <IP> <PUERTO> <FULL_NAME>");
                 System.exit(2);
             }
-            section   = args[1].trim();
-            nameParam = args[2].trim(); // no se toca (puede tener puntos, guiones, etc.)
-            date      = LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE); // no se usa, pero queda seteada
+            manualHost = args[1].trim();
+            try {
+                manualPort = Integer.parseInt(args[2].trim());
+            } catch (NumberFormatException nfe) {
+                System.err.println("PUERTO invalido. Valor: '" + args[2] + "'");
+                System.exit(4); return;
+            }
+            nameParam  = args[3].trim(); // nombre completo tal cual
+            date       = LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE); // no se usa
         }
 
         try {
-            IniFile cfgFile = IniFile.load(ini);
-            Config cfg = Config.from(cfgFile, section);
+            Config cfg = null;
+            if (!isManual) {
+                IniFile cfgFile = IniFile.load(ini);
+                cfg = Config.from(cfgFile, section);
 
-            logger.info("OPCION: " + option);
-            logger.info("Seccion: " + section);
-            logger.info("Host: " + cfg.host);
-            logger.info("Puerto: " + cfg.port);
-            logger.info("nameTemplate: " + cfg.nameTemplate);
-            logger.info("acceptedCodes: " + cfg.acceptedCodes);
-            logger.info("trailerCode (7 chars): " + cfg.trailerCodeSeven());
-            logger.info("reportNameTemplate: " + cfg.reportNameTemplate + " | report.process=" + (cfg.reportProcess ? "Y" : "N"));
+                logger.info("OPCION: " + option);
+                logger.info("Seccion: " + section);
+                logger.info("Host: " + cfg.host);
+                logger.info("Puerto: " + cfg.port);
+                logger.info("nameTemplate: " + cfg.nameTemplate);
+                logger.info("acceptedCodes: " + cfg.acceptedCodes);
+                logger.info("trailerCode (7 chars): " + cfg.trailerCodeSeven());
+                logger.info("reportNameTemplate: " + cfg.reportNameTemplate + " | report.process=" + (cfg.reportProcess ? "Y" : "N"));
+            } else {
+                logger.info("OPCION: 5 (manual)");
+                logger.info("Host manual: " + manualHost);
+                logger.info("Puerto manual: " + manualPort);
+                logger.info("FullName: " + nameParam);
+            }
 
             Boolean parseOverride = null;
-            new Sender(cfg, option, nameParam, date, parseOverride).run();
+            new Sender(cfg, option, nameParam, date, parseOverride, manualHost, manualPort, DEFAULT_ACCEPTED_CODES).run();
             System.exit(0);
         } catch (NoSuchFileException e) {
             System.err.println("No se encontro el archivo de configuracion: " + e.getFile());
@@ -206,11 +230,15 @@ public class McBatchSender {
         static void runInteractive(IniFile cfgFile) throws Exception {
             Scanner sc = new Scanner(System.in);
 
-            // Secciones disponibles
+            // Secciones disponibles (puede estar vacio si no hay INI)
             List<String> sections = cfgFile.sectionNames();
-            if (sections.isEmpty()) throw new IllegalArgumentException("El INI no contiene secciones.");
+
             System.out.println("\n=== McBatchSender (Modo Interactivo) ===");
-            System.out.println("Secciones disponibles: " + String.join(", ", sections));
+            if (sections.isEmpty()) {
+                System.out.println("No se encontraron secciones en mcsender.ini (solo funcionara la opcion 5 manual).");
+            } else {
+                System.out.println("Secciones disponibles: " + String.join(", ", sections));
+            }
 
             // 1) Opcion
             System.out.println("\nOpciones:");
@@ -218,20 +246,48 @@ public class McBatchSender {
             System.out.println("  2) Reporte MIP (consulta 10101...)");
             System.out.println("  3) Descarga T120 (YTF.AR.T120.F.E0002840.DYYMMDD.THHMMSS.A001)");
             System.out.println("  4) Descarga T112 (YTF.AR.T112.F.E0002840.DYYMMDD.THHMMSS.A001)");
-            System.out.println("  5) Descarga por nombre completo (envia el nombre tal cual)");
+            System.out.println("  5) Descarga por nombre completo (manual: IP, puerto, nombre)");
             int option = askInt(sc, "Ingrese la opcion [1-5]: ", 1, 5);
-
-            // 2) Seccion
-            String section = askString(sc, "Ingrese la seccion (ej. " + sections.get(0) + "): ").trim();
-            if (cfgFile.section(section) == null) {
-                throw new IllegalArgumentException("La seccion [" + section + "] no existe en el INI.");
-            }
-            Config cfg = Config.from(cfgFile, section);
 
             String fileNameArg = null; // para 1/2
             String hhmmss = null;      // para 3/4
             String fullName = null;     // para 5
             String date;
+            String section = null;
+            Config cfg = null;
+
+            if (option == 5) {
+                // Manual: no requiere INI ni seccion
+                String ip = askString(sc, "Ingrese IP del servidor: ").trim();
+                int port  = askInt(sc, "Ingrese PUERTO: ", 1, 65535);
+                fullName  = askString(sc, "Ingrese FULL_NAME a consultar (tal cual): ").trim();
+                if (fullName.isEmpty()) throw new IllegalArgumentException("Nombre completo vacio.");
+
+                // Fecha no usada en 5, pero se establece
+                date = LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+
+                System.out.println("\nResumen:");
+                System.out.println("  Opcion: 5 (manual)");
+                System.out.println("  Host: " + ip);
+                System.out.println("  Puerto: " + port);
+                System.out.println("  FULL_NAME: " + fullName);
+                System.out.println();
+
+                new Sender(null, 5, fullName, date, null, ip, port, DEFAULT_ACCEPTED_CODES).run();
+                return;
+            }
+
+            // Para 1/2/3/4 si no hay INI -> error
+            if (sections.isEmpty()) {
+                throw new IllegalArgumentException("No hay INI cargado. Las opciones 1-4 requieren seccion.");
+            }
+
+            // 2) Seccion
+            section = askString(sc, "Ingrese la seccion (ej. " + sections.get(0) + "): ").trim();
+            if (cfgFile.section(section) == null) {
+                throw new IllegalArgumentException("La seccion [" + section + "] no existe en el INI.");
+            }
+            cfg = Config.from(cfgFile, section);
 
             if (option == 1 || option == 2) {
                 String tpl = cfg.fileNameTemplate;
@@ -255,9 +311,6 @@ public class McBatchSender {
                     if (validateHHMMSS(hhmmss)) break;
                     System.out.println("HHMMSS invalido. Intente de nuevo.");
                 }
-            } else {
-                fullName = askString(sc, "Ingrese el nombre completo a consultar (tal cual): ").trim();
-                if (fullName.isEmpty()) throw new IllegalArgumentException("Nombre completo vacio.");
             }
 
             if (option == 1 || option == 2 || option == 3 || option == 4) {
@@ -283,8 +336,6 @@ public class McBatchSender {
                 System.out.println("  FILE_NAME: " + (fileNameArg == null ? "<template INI>" : fileNameArg));
             if (option == 3 || option == 4)
                 System.out.println("  HHMMSS: " + hhmmss);
-            if (option == 5)
-                System.out.println("  FULL_NAME: " + fullName);
             if (option != 5)
                 System.out.println("  DATE: " + date);
             if (option == 2) System.out.println("  Reporte (parsear): " + (parseOverride ? "SI" : "NO"));
@@ -292,10 +343,9 @@ public class McBatchSender {
 
             String nameParam;
             if (option == 3 || option == 4) nameParam = hhmmss;
-            else if (option == 5)          nameParam = fullName;
-            else                           nameParam = fileNameArg;
+            else                            nameParam = fileNameArg;
 
-            new Sender(cfg, option, nameParam, date, parseOverride).run();
+            new Sender(cfg, option, nameParam, date, parseOverride, null, null, DEFAULT_ACCEPTED_CODES).run();
         }
 
         private static int askInt(Scanner sc, String prompt, int min, int max) {
@@ -457,7 +507,7 @@ public class McBatchSender {
 
     static class IniFile {
         private final Map<String, Map<String,String>> data = new LinkedHashMap<>();
-        private IniFile() {}
+        IniFile() {}
         static IniFile load(Path path) throws IOException {
             if (!Files.exists(path)) throw new NoSuchFileException(path.toString());
             IniFile f = new IniFile();
@@ -488,24 +538,47 @@ public class McBatchSender {
     // ------------------------------ Sender ------------------------------
 
     static class Sender {
-        private final Config cfg;
+        private final Config cfg;                   // null en opcion 5
         private final int option;
         private final String fileNameOrParam;       // 1/2: FILE_NAME; 3/4: HHMMSS; 5: FULL_NAME
         private final String date;                  // AAAAMMDD (no usado en 5)
         private final Boolean reportProcessOverride;
 
-        Sender(Config cfg, int option, String fileNameOrParam, String cliDateParam, Boolean reportProcessOverride) {
+        // Campos manuales solo para opcion 5
+        private final String manualHost;
+        private final Integer manualPort;
+        private final List<String> manualAcceptedCodes;
+
+        Sender(Config cfg,
+               int option,
+               String fileNameOrParam,
+               String cliDateParam,
+               Boolean reportProcessOverride,
+               String manualHost,
+               Integer manualPort,
+               List<String> manualAcceptedCodes) {
             this.cfg = cfg;
             this.option = option;
             this.fileNameOrParam = (fileNameOrParam == null || fileNameOrParam.isEmpty())
-                    ? null : fileNameOrParam.toUpperCase();
+                    ? null : (option == 5 ? fileNameOrParam : fileNameOrParam.toUpperCase());
             this.reportProcessOverride = reportProcessOverride;
-            this.date = (cliDateParam != null && validateDate(cliDateParam))
-                    ? cliDateParam
-                    : (cfg.dateOverride != null && validateDate(cfg.dateOverride)
-                        ? cfg.dateOverride
-                        : LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE));
-            logger.info("Fecha efectiva: " + this.date);
+
+            if (option == 5) {
+                this.date = LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE); // no se usa
+            } else {
+                String cfgDate = (cfg != null ? cfg.dateOverride : null);
+                this.date = (cliDateParam != null && validateDate(cliDateParam))
+                        ? cliDateParam
+                        : (cfgDate != null && validateDate(cfgDate)
+                            ? cfgDate
+                            : LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE));
+                logger.info("Fecha efectiva: " + this.date);
+            }
+
+            this.manualHost = manualHost;
+            this.manualPort = manualPort;
+            this.manualAcceptedCodes = (manualAcceptedCodes == null || manualAcceptedCodes.isEmpty())
+                    ? DEFAULT_ACCEPTED_CODES : manualAcceptedCodes;
         }
 
         void run() {
@@ -513,7 +586,7 @@ public class McBatchSender {
             else if (option == 2) runReport();
             else if (option == 3) runDownloadByNomenclature(120);
             else if (option == 4) runDownloadByNomenclature(112);
-            else if (option == 5) runDownloadByExactName();
+            else if (option == 5) runDownloadByExactNameManual();
             else throw new IllegalArgumentException("OPCION invalida: " + option);
         }
 
@@ -521,6 +594,7 @@ public class McBatchSender {
 
         private void runSend() {
             logger.info("=== OPCION 1: Envio ===");
+            if (cfg == null) throw new IllegalStateException("Config requerida para opcion 1.");
 
             validateEnvironmentForSend(cfg);
 
@@ -597,6 +671,7 @@ public class McBatchSender {
 
         private void runReport() {
             logger.info("=== OPCION 2: Reporte ===");
+            if (cfg == null) throw new IllegalStateException("Config requerida para opcion 2.");
 
             validateEnvironmentForReport();
 
@@ -688,6 +763,7 @@ public class McBatchSender {
 
         private void runDownloadByNomenclature(int tCode) {
             logger.info("=== OPCION " + (tCode == 120 ? "3" : "4") + ": Descarga T" + tCode + " ===");
+            if (cfg == null) throw new IllegalStateException("Config requerida para opcion " + (tCode == 120 ? "3" : "4") + ".");
 
             if (fileNameOrParam == null || !validateHHMMSS(fileNameOrParam)) {
                 throw new IllegalArgumentException("HHMMSS invalido o ausente.");
@@ -722,11 +798,11 @@ public class McBatchSender {
                 String preview = rawAcc.substring(0, Math.min(120, rawAcc.length())).replace("\n","\\n");
                 logger.info("Preview respuesta (" + rawAcc.length() + "B): " + preview);
 
-                // Criterio laxo: igual a GCO_MIP original
+                // Criterio laxo
                 boolean found =
-                        containsAny(rawAcc.toString(), cfg.acceptedCodes)               // 9980100 completo
-                     || containsAnyAcceptedPrefix(rawAcc.toString(), cfg.acceptedCodes) // 998010 prefijo
-                     || rawAcc.length() > 0;                                            // hubo data
+                        containsAny(rawAcc.toString(), cfg.acceptedCodes)
+                     || containsAnyAcceptedPrefix(rawAcc.toString(), cfg.acceptedCodes)
+                     || rawAcc.length() > 0;
 
                 if (found) {
                     logger.info("Archivo encontrado [OK] -> guardando crudo");
@@ -742,11 +818,14 @@ public class McBatchSender {
             logger.info("=== FIN OPCION " + (tCode == 120 ? "3" : "4") + " ===");
         }
 
-        // ---------------------- Opcion 5: Descarga por nombre completo --------
+        // --------------- Opcion 5: Descarga por nombre completo (MANUAL) ------
 
-        private void runDownloadByExactName() {
-            logger.info("=== OPCION 5: Descarga por nombre completo ===");
+        private void runDownloadByExactNameManual() {
+            logger.info("=== OPCION 5: Descarga por nombre completo (manual) ===");
 
+            if (manualHost == null || manualHost.isEmpty() || manualPort == null) {
+                throw new IllegalArgumentException("Host/puerto manual no establecidos.");
+            }
             if (fileNameOrParam == null || fileNameOrParam.trim().isEmpty()) {
                 throw new IllegalArgumentException("Nombre completo vacio.");
             }
@@ -755,9 +834,9 @@ public class McBatchSender {
             logger.info("Nombre a solicitar: " + fullName);
 
             try (Socket sock = new Socket()) {
-                logger.info("[IP:" + cfg.host + "][PTO:" + cfg.port + "]");
-                sock.connect(new InetSocketAddress(cfg.host, cfg.port), cfg.connectTimeoutMs);
-                sock.setSoTimeout(cfg.soTimeoutMs);
+                logger.info("[IP:" + manualHost + "][PTO:" + manualPort + "]");
+                sock.connect(new InetSocketAddress(manualHost, manualPort), DEFAULT_CONNECT_TIMEOUT_MS);
+                sock.setSoTimeout(DEFAULT_SO_TIMEOUT_MS);
                 logger.info("Estado de conexion con el MIP: " + sock.isConnected());
 
                 writeNameFrame(sock, fullName, EBCDIC);
@@ -767,7 +846,7 @@ public class McBatchSender {
                 while (moreData) {
                     String chunk = readLegacyBlock(sock, EBCDIC);
                     rawAcc.append(chunk);
-                    if (chunk.isEmpty() || containsAnyAcceptedPrefix(rawAcc.toString(), cfg.acceptedCodes)) {
+                    if (chunk.isEmpty() || containsAnyAcceptedPrefix(rawAcc.toString(), manualAcceptedCodes)) {
                         moreData = false;
                     }
                 }
@@ -776,10 +855,10 @@ public class McBatchSender {
                 String preview = rawAcc.substring(0, Math.min(120, rawAcc.length())).replace("\n","\\n");
                 logger.info("Preview respuesta (" + rawAcc.length() + "B): " + preview);
 
-                // Criterio laxo: igual a GCO_MIP original
+                // Criterio laxo (igual que GCO_MIP)
                 boolean found =
-                        containsAny(rawAcc.toString(), cfg.acceptedCodes)
-                     || containsAnyAcceptedPrefix(rawAcc.toString(), cfg.acceptedCodes)
+                        containsAny(rawAcc.toString(), manualAcceptedCodes)
+                     || containsAnyAcceptedPrefix(rawAcc.toString(), manualAcceptedCodes)
                      || rawAcc.length() > 0;
 
                 if (found) {
@@ -790,7 +869,7 @@ public class McBatchSender {
                     logger.severe("*** Archivo no encontrado [FAIL]");
                 }
             } catch (Exception e) {
-                logger.severe("Error en descarga por nombre completo: " + e.getMessage());
+                logger.severe("Error en descarga por nombre completo (manual): " + e.getMessage());
             }
 
             logger.info("=== FIN OPCION 5 ===");
