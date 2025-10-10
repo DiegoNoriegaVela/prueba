@@ -1,13 +1,17 @@
 //=================================================================================================
 // McBatchSender
 //
-// Opciones CLI:
+// Opciones CLI directas:
 //   1) Envio                        : java McBatchSender 1 <SECCION> <FILE> <YYYYMMDD>
 //   2) Descarga y genera reporte    : java McBatchSender 2 <SECCION> <FILE> <YYYYMMDD>
 //   3) Descarga (cruda)             : java McBatchSender 3 <SECCION> <FILE> <YYYYMMDD>
 //   4) Envio manual (IP/PUERTO/NOM) : java McBatchSender 4 <IP> <PUERTO> <FULL_NAME>
 //
-// Si no pasas argumentos, se abre un menu por consola.
+// Si no pasas argumentos, se abre un menu por consola (flujo estricto):
+//   - Opcion (1..4)
+//   - Seccion (para 1..3) / IP, Puerto, FULL_NAME (para 4)
+//   - FILE (si 1..3)
+//   - Fecha YYYYMMDD (si 1..3)
 //
 // Plantillas en secciones de negocio:
 //   - formatSendMC     p.ej. 00401{FILE}{julianDate}
@@ -17,16 +21,18 @@
 // Transporte: TCP puro. Header 2B big-endian + cuerpo EBCDIC (tabla manual).
 // Envio: trama con prefijo 'R' (ASCII) antes de convertir a EBCDIC. Trailer 11B: 7 chars OK + 4B contador ajustados.
 //
-// Manejo de error (preview):
-//   - Si el servidor responde pero no hay codigo de aceptacion, no se genera el archivo esperado.
-//   - Se muestra un preview de los primeros 80 bytes recibidos.
-//   - Se guarda todo lo recibido en ERROR_{FILE} (o ERROR_{FULL_NAME} en opcion 4).
+// Manejo de error estricto:
+//   - Si la respuesta NO contiene ningun acceptedCode de [GENERAL], se trata como error:
+//       * Se imprime preview de 80 bytes.
+//       * Se escribe ERROR_{FILE} (o ERROR_{FULL_NAME} en opcion 4) con todo lo recibido.
+//       * En opciones 1/2/3 no se escribe archivo exitoso.
+//       * En opcion 4 SIEMPRE se escribe el archivo normal, y ademas el ERROR_ si no hay aceptacion.
+//   - Si la respuesta empieza por defaultFailCode (o lo contiene), se considera error igual.
 //
 // INI (en CWD con nombre mcsender.ini):
-//   [GENERAL]          parametros comunes
-//   [HOST_*]           host y port de destino
-//   [<NEGOCIO>]        reglas de negocio y referencias a host (hostRef)
-//
+//   [GENERAL]           comunes
+//   [HOST_*]            host y port
+//   [<NEGOCIO>]         reglas de negocio y hostRef
 //=================================================================================================
 
 import java.io.*;
@@ -61,7 +67,7 @@ public class McBatchSender {
     // -------------------------------- main --------------------------------
 
     public static void main(String[] args) {
-        final Path ini = Paths.get("mcsender.ini");
+        final Path ini = Paths.get("mcsender.ini"); // fijo en CWD
         if (args.length == 0) {
             runInteractive(ini);
             return;
@@ -90,8 +96,13 @@ public class McBatchSender {
                 String host = args[1].trim();
                 int port = Integer.parseInt(args[2].trim());
                 String fullName = args[3].trim();
+
                 General gen = General.from(iniFile);
-                Sender.runManualExact(host, port, fullName, gen.acceptedCodes);
+
+                System.out.println("[ENVIO MANUAL] Destino: " + host + ":" + port);
+                System.out.println("[ENVIO MANUAL] Nombre exacto: " + fullName);
+
+                Sender.runManualExact(host, port, fullName, gen.acceptedCodes, gen.defaultFailCode);
                 System.exit(0);
             }
 
@@ -110,8 +121,13 @@ public class McBatchSender {
             }
 
             General gen = General.from(iniFile);
-            Business biz = Business.from(iniFile, businessSection);
+
+            // Validar seccion de negocio y host (si no existe, error inmediato)
+            Business biz = Business.from(iniFile, businessSection); // lanza si falta
             HostCfg host = HostCfg.from(iniFile, isBlank(biz.hostRef) ? "HOST_MC" : biz.hostRef);
+
+            // Mostrar datos de la seccion
+            printSectionSummary(businessSection, biz, host);
 
             logger.info("OPCION=" + option + " | Seccion=" + businessSection + " | Host=" + host.host + ":" + host.port);
 
@@ -162,13 +178,32 @@ public class McBatchSender {
                 int port = Integer.parseInt(sc.nextLine().trim());
                 System.out.print("Nombre completo a enviar (FULL_NAME): ");
                 String fullName = sc.nextLine().trim();
+
                 General gen = General.from(iniFile);
-                Sender.runManualExact(ip, port, fullName, gen.acceptedCodes);
+
+                System.out.println("[ENVIO MANUAL] Destino: " + ip + ":" + port);
+                System.out.println("[ENVIO MANUAL] Nombre exacto: " + fullName);
+
+                Sender.runManualExact(ip, port, fullName, gen.acceptedCodes, gen.defaultFailCode);
                 return;
             }
 
             System.out.print("Seccion de negocio (ej. GCO, MIP, GCO_DEV): ");
             String sec = sc.nextLine().trim();
+
+            // Validar la seccion inmediatamente; si no existe, mostrar error
+            Business biz;
+            HostCfg host;
+            try {
+                biz  = Business.from(iniFile, sec);
+                host = HostCfg.from(iniFile, isBlank(biz.hostRef) ? "HOST_MC" : biz.hostRef);
+            } catch (Exception ex) {
+                System.out.println("Seccion invalida: " + ex.getMessage());
+                return;
+            }
+
+            // Mostrar resumen de la seccion valida
+            printSectionSummary(sec, biz, host);
 
             System.out.print("Ingresa FILE (cualquier longitud): ");
             String fileParam = sc.nextLine().trim();
@@ -181,8 +216,6 @@ public class McBatchSender {
             }
 
             General gen = General.from(iniFile);
-            Business biz = Business.from(iniFile, sec);
-            HostCfg host = HostCfg.from(iniFile, isBlank(biz.hostRef) ? "HOST_MC" : biz.hostRef);
 
             if (option == 1) Sender.runSend(gen, host, biz, fileParam, dateStr);
             else if (option == 2) Sender.runReportParsed(gen, host, biz, fileParam, dateStr);
@@ -190,6 +223,16 @@ public class McBatchSender {
         } catch (Exception e) {
             System.err.println("Error interactivo: " + e.getMessage());
         }
+    }
+
+    private static void printSectionSummary(String sec, Business biz, HostCfg host) {
+        System.out.println("---- Seccion valida: [" + sec + "] ----");
+        System.out.println("Host: " + host.host + ":" + host.port);
+        System.out.println("originalFile : " + biz.originalFile);
+        System.out.println("historyFile  : " + biz.historyFile);
+        System.out.println("formatSendMC : " + biz.formatSendMC);
+        System.out.println("formatRecieveMC : " + biz.formatRecieveMC);
+        System.out.println("---------------------------------------");
     }
 
     // ------------------------------- INI parser -------------------------------
@@ -351,7 +394,7 @@ public class McBatchSender {
                 }
 
                 String nameToSend = applyFormat(biz.formatSendMC, fileParam, yyyymmdd);
-                logger.info("Nombre a enviar: " + nameToSend);
+                System.out.println("[Nombre exacto consultado/enviado] " + nameToSend);
 
                 List<byte[]> chunks = split(payload, gen.chunkSize);
                 String finalStatus = gen.defaultFailCode;
@@ -368,7 +411,7 @@ public class McBatchSender {
 
                     if (!isBlank(gen.alreadySentSubstring) && resp.contains(gen.alreadySentSubstring)) {
                         finalStatus = firstAcceptedOrDefault(gen);
-                    } else if (equalsAny(resp, gen.acceptedCodes)) {
+                    } else if (containsAny(resp, gen.acceptedCodes)) {
                         for (byte[] p : chunks) writeChunkFrame(sock, p);
 
                         String trailerCode7 = pickTrailer7(gen.acceptedCodes);
@@ -376,13 +419,15 @@ public class McBatchSender {
 
                         String resp2 = readResponse(sock).trim();
                         logger.info("Confirmacion: [" + resp2 + "]");
-                        if (equalsAny(resp2, gen.acceptedCodes)) {
+                        if (containsAny(resp2, gen.acceptedCodes)) {
                             finalStatus = firstAcceptedOrDefault(gen);
                             logger.info("ENVIO OK");
                         } else {
+                            handleStrictFailure(resp2, gen.defaultFailCode, nameToSend, ""); // preview y ERROR_
                             logger.warning("ENVIO FAIL");
                         }
                     } else {
+                        handleStrictFailure(resp, gen.defaultFailCode, nameToSend, "");
                         logger.warning("Nombre rechazado");
                     }
                 } catch (Exception e) {
@@ -401,11 +446,13 @@ public class McBatchSender {
             logger.info("=== OPCION 2: Descarga y genera reporte ===");
             try {
                 String base = applyFormat(biz.formatRecieveMC, fileParam, yyyymmdd);
-                logger.info("Base reporte: " + base);
+                System.out.println("[Nombre exacto consultado] " + base + "01..99");
 
                 StringBuilder raw = new StringBuilder();
                 StringBuilder fmt = new StringBuilder();
                 boolean found = false;
+
+                String lastResponseAny = "";
 
                 try (Socket sock = new Socket()) {
                     sock.connect(new InetSocketAddress(host.host, host.port), gen.connectTimeoutMs);
@@ -415,7 +462,7 @@ public class McBatchSender {
                     for (int i = 1; i <= 99; i++) {
                         String sec = String.format("%02d", i);
                         String query = base + sec;
-                        logger.info("Consultando: " + query);
+                        System.out.println("[Nombre exacto consultado] " + query);
 
                         writeNameFrame(sock, query);
 
@@ -426,10 +473,12 @@ public class McBatchSender {
                             String chunk = readLegacyBlock(sock);
                             fmtAcc.append('[').append(chunk).append("]\n");
                             rawAcc.append(chunk);
-                            if (chunk.isEmpty() || containsAnyPrefix(fmtAcc.toString(), gen.acceptedCodes)) {
+                            if (chunk.isEmpty()) {
                                 more = false;
                             }
                         }
+
+                        lastResponseAny = rawAcc.toString();
 
                         if (containsAny(rawAcc.toString(), gen.acceptedCodes)) {
                             raw.setLength(0);
@@ -450,17 +499,15 @@ public class McBatchSender {
                     try {
                         ordered = orderDetails(fmt.toString(), ok);
                     } catch (Exception ex) {
-                        logger.severe("Fallo parseo, se guarda crudo: " + ex.getMessage());
-                        ordered = raw.toString();
+                        logger.severe("Fallo parseo, se considera error: " + ex.getMessage());
+                        handleStrictFailure(raw.toString(), gen.defaultFailCode, base, raw.toString());
+                        return;
                     }
                     writeReportFile(yyyymmdd, ordered, fileParam);
                     logger.info("Reporte OK");
                 } else {
-                    logger.severe("No se encontro archivo en 01..99 con codigo de aceptacion");
-                    // Aqui no tenemos acumulado unico (solo se guarda cuando se encuentra)
-                    String preview = first80("");
-                    if (!preview.isEmpty()) System.out.println("Preview(80): " + preview);
-                    writeErrorFile("ERROR_" + fileParam, "");
+                    handleStrictFailure(lastResponseAny, gen.defaultFailCode, base, lastResponseAny);
+                    logger.severe("No se encontro archivo con codigo de aceptacion");
                 }
             } catch (Exception e) {
                 logger.severe("Error Reporte: " + e.getMessage());
@@ -476,7 +523,7 @@ public class McBatchSender {
                 sock.setSoTimeout(gen.soTimeoutMs);
 
                 String query = applyFormat(biz.formatRecieveMC, fileParam, yyyymmdd);
-                logger.info("Pidiendo: " + query);
+                System.out.println("[Nombre exacto consultado] " + query);
 
                 writeNameFrame(sock, query);
 
@@ -485,22 +532,19 @@ public class McBatchSender {
                 while (more) {
                     String chunk = readLegacyBlock(sock);
                     raw.append(chunk);
-                    if (chunk.isEmpty() || containsAnyPrefix(raw.toString(), gen.acceptedCodes)) {
+                    if (chunk.isEmpty()) {
                         more = false;
                     }
                 }
 
-                boolean ok = containsAny(raw.toString(), gen.acceptedCodes)
-                          || containsAnyPrefix(raw.toString(), gen.acceptedCodes);
+                String all = raw.toString();
 
-                if (ok) {
-                    writeRawToNamedFile(query, raw.toString());
+                if (containsAny(all, gen.acceptedCodes)) {
+                    writeRawToNamedFile(query, all);
                     logger.info("Descarga OK");
                 } else {
+                    handleStrictFailure(all, gen.defaultFailCode, query, all);
                     logger.severe("Respuesta sin codigo de aceptacion. No se genera archivo objetivo.");
-                    String preview = first80(raw.toString());
-                    if (!preview.isEmpty()) System.out.println("Preview(80): " + preview);
-                    writeErrorFile("ERROR_" + fileParam, raw.toString());
                 }
             } catch (Exception e) {
                 logger.severe("Error Descarga: " + e.getMessage());
@@ -509,11 +553,13 @@ public class McBatchSender {
         }
 
         // Envio manual exacto (opcion 4)
-        static void runManualExact(String host, int port, String fullName, List<String> acceptedCodes) {
+        static void runManualExact(String host, int port, String fullName, List<String> acceptedCodes, String defaultFailCode) {
             logger.info("=== OPCION 4: Envio manual (nombre exacto) ===");
             try (Socket sock = new Socket()) {
                 sock.connect(new InetSocketAddress(host, port), 60000);
                 sock.setSoTimeout(60000);
+
+                System.out.println("[Nombre exacto consultado/enviado] " + fullName);
 
                 writeNameFrame(sock, fullName);
 
@@ -522,22 +568,33 @@ public class McBatchSender {
                 while (more) {
                     String chunk = readLegacyBlock(sock);
                     raw.append(chunk);
-                    if (chunk.isEmpty() || containsAnyPrefix(raw.toString(), acceptedCodes)) {
+                    if (chunk.isEmpty()) {
                         more = false;
                     }
                 }
 
-                boolean ok = containsAny(raw.toString(), acceptedCodes)
-                          || containsAnyPrefix(raw.toString(), acceptedCodes);
+                String all = raw.toString();
+                String preview = first80(all);
+                if (!preview.isEmpty()) System.out.println("Preview(80): " + preview);
 
-                if (ok) {
-                    writeRawToNamedFile(fullName, raw.toString());
-                    logger.info("Manual exacto OK");
+                // Manual: siempre escribir el archivo normal
+                try {
+                    writeRawToNamedFile(fullName, all);
+                } catch (IOException ioe) {
+                    logger.severe("No se pudo escribir archivo manual: " + ioe.getMessage());
+                }
+
+                // Si no aceptado o si parece error -> tambien escribir ERROR_
+                boolean ok = containsAny(all, acceptedCodes);
+                boolean looksError = startsWithOrContains(all, defaultFailCode);
+                if (!ok || looksError) {
+                    try {
+                        writeErrorFile("ERROR_" + sanitize(fullName), all);
+                    } catch (IOException ioe) {
+                        logger.severe("No se pudo escribir archivo ERROR_: " + ioe.getMessage());
+                    }
                 } else {
-                    logger.severe("Respuesta sin codigo de aceptacion. No se genera archivo objetivo.");
-                    String preview = first80(raw.toString());
-                    if (!preview.isEmpty()) System.out.println("Preview(80): " + preview);
-                    writeErrorFile("ERROR_" + sanitize(fullName), raw.toString());
+                    logger.info("Manual exacto OK");
                 }
             } catch (Exception e) {
                 logger.severe("Error Manual exacto: " + e.getMessage());
@@ -797,27 +854,16 @@ public class McBatchSender {
             return best;
         }
 
-        private static boolean equalsAny(String value, List<String> options) {
-            if (options == null || options.isEmpty()) return false;
-            for (String o : options) if (value.equals(o)) return true;
-            return false;
-        }
-
         private static boolean containsAny(String haystack, List<String> options) {
             if (options == null || options.isEmpty()) return false;
-            for (String o : options) if (haystack.contains(o)) return true;
+            for (String o : options) if (!isBlank(o) && haystack.contains(o.trim())) return true;
             return false;
         }
 
-        private static boolean containsAnyPrefix(String haystack, List<String> options) {
-            if (options == null || options.isEmpty()) return false;
-            for (String o : options) {
-                String p = o.trim();
-                if (p.isEmpty()) continue;
-                String pref = (p.length() >= 6 ? p.substring(0, 6) : p);
-                if (haystack.contains(pref)) return true;
-            }
-            return false;
+        private static boolean startsWithOrContains(String haystack, String code) {
+            if (isBlank(code)) return false;
+            String c = code.trim();
+            return haystack.startsWith(c) || haystack.contains(c);
         }
 
         private static void writeReportFile(String yyyymmdd, String data, String fileParam) throws IOException {
@@ -850,6 +896,19 @@ public class McBatchSender {
 
         private static String sanitize(String s) {
             return s == null ? "" : s.replaceAll("[^A-Za-z0-9._-]", "_");
+        }
+
+        private static void handleStrictFailure(String responseText, String defaultFailCode, String labelName, String fullPayload) {
+            String preview = first80(responseText);
+            if (!preview.isEmpty()) System.out.println("Preview(80): " + preview);
+
+            String base = (labelName == null || labelName.isEmpty()) ? "RESPUESTA" : labelName;
+            String errName = "ERROR_" + sanitize(base);
+            try {
+                writeErrorFile(errName, (fullPayload == null || fullPayload.isEmpty()) ? responseText : fullPayload);
+            } catch (IOException ioe) {
+                logger.severe("No se pudo escribir archivo de error: " + ioe.getMessage());
+            }
         }
 
         // -------------------------- historico (solo envio) --------------------------
@@ -908,38 +967,3 @@ public class McBatchSender {
         }
     }
 }
-
-[GENERAL]
-connectTimeoutMs=60000
-soTimeoutMs=60000
-chunkSize=980
-acceptedCode=9980100
-alreadySentSubstring=9288W
-defaultFailCode=9980101
-
-[HOST_MC]
-host=10.238.183.1
-port=6246
-
-##################################################################
-
-[MIP]
-hostRef=HOST_MC
-originalFile=MIPFILE_DATI
-historyFile=MIPFILE_HISTORY_R
-formatSendMC=00401{FILE}{julianDate}
-formatRecieveMC=10101{FILE}{julianDate}
-
-[GCO]
-hostRef=HOST_MC
-originalFile=GCOFILE_DATI
-historyFile=GCOFILE_HISTORY_R
-formatSendMC=00401{FILE}{julianDate}
-formatRecieveMC=10101{FILE}{julianDate}
-
-[GCO_3]
-hostRef=HOST_MC
-originalFile=GCOFILE_DATI
-historyFile=GCOFILE_HISTORY_R
-formatSendMC=00401{FILE}{julianDate}
-formatRecieveMC=10101YTF.AR.T120.F.E0002840.{FILE}{julianDate}
