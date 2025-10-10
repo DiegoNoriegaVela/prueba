@@ -415,20 +415,36 @@ public class McBatchSender {
             logger.info("=== OPCION 4: Envio manual ===");
             logger.info("Host: " + ip + " Puerto: " + port);
             logger.info("Nombre a enviar: " + fullName);
-
+        
             try (Socket sock = new Socket()) {
                 sock.connect(new InetSocketAddress(ip, port), g.connectTimeoutMs);
                 sock.setSoTimeout(g.soTimeoutMs);
-
+        
+                // Enviar nombre (2B header + cuerpo EBCDIC)
                 writeFrameName(sock, fullName);
-                String resp = readResponse(sock).trim();
-                logger.info("Resp: [" + resp + "]");
+        
+                // Leer una respuesta estilo legacy (one-shot, filtrando imprimibles)
+                String raw = readLegacyOneShot(sock);
+        
+                // Preview 80B en consola
+                String preview = (raw == null) ? "" : raw.replace("\r", " ").replace("\n", " ");
+                if (preview.length() > 80) preview = preview.substring(0, 80);
+                logger.info("[Preview 80B] " + preview);
+        
+                // Escribir exactamente en el archivo indicado por 'fullName'
+                try (PrintStream ps = new PrintStream(new FileOutputStream(fullName), true, "UTF-8")) {
+                    ps.print(raw == null ? "" : raw);
+                }
+        
+                // Log compacto de la respuesta
+                logger.info("Resp: [" + (raw == null ? "" : raw.trim()) + "]");
             } catch (Exception ex) {
                 logger.severe("Error envio manual: " + ex.getMessage());
             } finally {
                 logger.info("=== FIN OPCION 4 ===");
             }
         }
+
 
         // ==================== I/O de red y framing (EBCDIC manual) ====================
 
