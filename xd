@@ -1,75 +1,94 @@
+[Inicio SWCC935B]
+    |
+    v
+(0) Inicialización + bitácora en área de datos
+    - DCL &RSP *CHAR(2), &HORA *CHAR(7), &POS *DEC(3,0)=201
+    - RTVSYSVAL QTIME  -> &HORA
+    - CHGDTAARA UBLIBPR/SWCD01 (&POS 50)  'Mensaje con hora'   (se va incrementando &POS)
+    - ✔ Sirve para trazar cada “Marca” del proceso.
 
-[Inicio SWCC600]
     |
     v
-(0) Inicialización de fecha/hora
-    - RTVJOBA  DATE(&DAT)
-    - CHGJOB   DATE(&DAT)
-    - CVTDAT   DATE(&DAT)  -> &FECHA (*YYMD, sin separador)
-    - ⚠ Riesgo: re-ejecución con fecha incorrecta.
+(1) Copia de fuentes a “subfxx” (staging)
+    - CPYF FROMFILE(UBLIBPR/TABCARD) TOFILE(UBLIBPR/SUBF01S) MBROPT(*REPLACE) FMTOPT(*NOCHK)
+    - CPYF FROMFILE(UBLIBPR/TABPAN)  TOFILE(UBLIBPR/SUBF02S) MBROPT(*REPLACE) FMTOPT(*NOCHK)
+    - Objetivo: tener dos tablas comparables (SUN vs MAD).
+    - ⚠ Riesgo: *NOCHK acepta registros/mapeos “raros”; re-ejecución sin limpiar = duplicados.
+
     |
     v
-(1) Anula TD emitidas y no activadas
-    - CALL PLTDP85
-    - Objetivo: depurar plásticos que NO deben seguir al embosse.
-    - ✔ Control: validar totales anulados del día.
+(2) Conciliación SUN ↔ MAD (RPG)
+    - CLRPFM SUBF01R  /  CLRPFM SUBF02R
+    - CALL SWCR935
+        · Lee SUBF01S y SUBF02S
+        · Escribe SUBF01R / SUBF02R con códigos de diferencia (1001, 1002, 1003, 1004, 1005…)
+    - ✔ Resultado: listas de excepciones para tratar en el siguiente paso.
+
     |
     v
-(2) Asigna CDR a innominadas desde valorados
-    - CALL SWCC903B  &FECHA  '999'
-    - Prepara/etiqueta movimientos de innominadas.
-    - ⚠ Riesgo: re-ejecución sin limpiar → duplica base de innominadas.
+(3) Validación operativa previa
+    - SNDUSRMSG 'MAD 5: Operador verifique si UNI00700CL está activo. Confirme: OK'
+    - Si no confirman, se queda “ciclando” en la marca.
+    - ✔ Asegura que el servicio externo esté disponible.
+
     |
     v
-(3) Genera innominadas
-    - CALL SUBCMNU 'SWCR120'
-    - Crea registros base para innominadas del día.
-    - ⚠ Riesgo: sin CLRPFM previo, suma pedidos (duplicados).
+(4) Genera salidas intermedias (RPG) con overrides
+    - CLRPFM SWCF06B
+    - OVRDBF  SWCF06   -> SWCF06B
+      OVRDBF  SWCL0601 -> SWCL06B01
+      OVRDBF  SWCL0602 -> SWCL06B02
+      OVRDBF  SWCL0611 -> SWCL06B11
+    - CALL SWCR936
+        · Lee SUBF01R / SUBF02R
+        · Genera operaciones/cambios (600, 605, 650, etc.) y salidas batch (p.ej. UNI41LAM/UNI51LAM)
+          usando las tablas “B” (por los OVRDBF).
+    - DLTOVR FILE(SWCF06 SWCL0601 SWCL0602 SWCL0611)
+    - Bitácora: “Fin grabación en uni51lam”
+    - DLYJOB 900  (15 min)  → “Fin espera generar uni41lam”
+    - ⚠ Riesgos:
+        · Overrides mal apuntados → escribe en PF equivocados.
+        · Re-ejecución sin CLRPFM → duplica movimientos.
+        · La espera (15 min) puede quedar corta/larga y desalinear con el siguiente paso.
+
     |
     v
-(4) Genera Telewiese / Multipago / Masivas
-    - CALL SWCC950  &FECHA
-    - Armado de salidas ligadas a TW/MP (algunas nacen ACTIVAS).
-    - ⚠ Nota: no confundir “estado activo” con “plan de embosse”.
+(5) Construye archivo UNIBATCH para envío a SUN (RPG)
+    - Etiqueta: BRINCO02
+    - CLRPFM ESP62D/UNIBATCH
+    - CALL ESP62E/UNI00601BW '3'
+        · Abre/lee UNI41LAM y arma:
+          'A' (cabecera) + múltiples 'B' (detalle) + 'Z' (cola) → UNIBATCH
+    - RTVMBRD FILE(ESP62D/UNIBATCH) NBRRCD(&NREG)
+      IF (&NREG <= 2) THEN
+         SNDUSRMSG 'MAD 6: File Transfer AIX vacío. Verificar y confirmar OK'
+         DLYJOB 900
+         GOTO BRINCO02
+      ENDDO
+    - ⚠ Riesgos:
+        · UNIBATCH vacío por atraso de UNI41LAM → bucles/reintentos.
+        · Si no se limpia y se reintenta, AIX puede recibir duplicados.
+
     |
     v
-(5) Envío de relación EW al courier (vía Wiese)
-    - CALL SWCC966  &FECHA
-    - CALL SWCC967  &FECHA  (variante MC-procesos)
-    - Emite relaciones para logística; no debería alterar cantidades.
+(6) Envía UNIBATCH por FTP al SUN
+    - (Temporal) RUNSQL DELETE FROM ESP62D/UNIBATCH WHERE SUBSTR(UNIBATCH,40,6) IN ('424137','518587','518819')
+      (filtro de BINs “hasta formalizar”)
+    - OVRDBF FILE(INPUT)  TOFILE(UBLIBPR/FTPIN02)  MBR(FTPIN02)
+      OVRDBF FILE(OUTPUT) TOFILE(UBLIBPR/FTPOU02) MBR(FTPOU02)
+    - FTP  RMTSYS(*LOOPBACK / host configurado)
+    - DLTOVR FILE(INPUT OUTPUT)
+    - SNDUSRMSG 'MAD 7: Operador AIX revise archivo unibatch. Confirme OK o XX (error)'
+      IF &RSP = 'XX' → GOTO reenvío (brinco03)
+    - ⚠ Riesgos: reenvíos manuales sin limpiar → doble envío; filtro por BIN desincroniza conteos.
+
     |
     v
-(6) **Genera orden de EMBOSSE para MVS (núcleo)**
-    - **CALL SWCC930  &FECHA**
-      · Preparación:
-         - CLRPFM  &LIBBD/SWCF63
-         - OVRDBF  SWCL0601->SWCL06B01, SWCL0602->SWCL06B02, SWCL0611->SWCL06B11, etc.
-      · Construcción de la orden:
-         - **CALL SWCR930 (RPG)**
-             → escribe **SWCF63R/SWCF63** (detalle de embosse del día)
-             → si hay TRACE, escribe **SWCF06R** (operaciones SUN 600/650)
-         - ⚠ Si falla TRACE: habrá embosse sin op. SUN → desalineo de conteos.
-      · Publicaciones / salida:
-         - DLTOVR *ALL
-         - CPYF  &LIBBD/SWCF63   -> **UBLIBPR/SWCF63**   (MBROPT *REPLACE)  ← **foto del día**
-         - CPYF  UBLIBPR/SWCF63  -> **&LIBPF/LTDD23**   (MBROPT *REPLACE, FMTOPT *NOCHK)
-         - CPYF  &LIBBD/SWCF63   -> **UBLIBPR/SWCH63**  (MBROPT *ADD)       ← **histórico**
-         - Reportes: PLWCP139 / PLWCP156 / PLWCP197
-      · ⚠ Puntos críticos:
-         - Usar SWCH63 sin filtrar fecha suma histórico (ADD) y “engorda”.
-         - FMTOPT(*NOCHK) puede aceptar registros mal mapeados hacia LTDD23.
-         - Overrides no quitados a tiempo → copias desde PF incorrecto.
-         - Re-ejecución sin limpiar PF del día → duplicaciones.
+(7) Procesa cambios administrativos en SUN (paso externo)
+    - SNDUSRMSG 'MAD 8: Operador AIX ejecutar CARGATAR. Confirme con OK'
+    - Tras confirmación: se registra en SWCD01 y continúa.
+    - (Paso “CARGAKEY” aparece comentado en algunas versiones)
+
     |
     v
-(7) Calcula fecha de vencimiento TD
-    - CALL PLWCP312
-    - Ajusta vencimientos post-embosse (no debería cambiar cantidad).
-    |
-    v
-(8) Cierres / eventuales
-    - CALL SWCC996  (procesos eventuales de cierre)
-    - (Otras líneas de log/preparación están comentadas)
-    |
-    v
-[Fin SWCC600]
+[Fin SWCC935B]
