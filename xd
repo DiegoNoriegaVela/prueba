@@ -1,6 +1,5 @@
-RUNSQL SQL('DELETE FROM ESP62D/UNIBATCH U
-            WHERE EXISTS (SELECT 1
-                            FROM UBLIBPR/SWCF01 M
-                           WHERE M.NROPAN = U.PAN
-                             AND M.ESTADO <> ''P'')')
+/* Quita cualquier registro que no sea 'P' en las salidas del día */
+RUNSQL SQL('DELETE FROM UBLIBPR/SWCL06B01 WHERE ESTADO <> ''P''')
+RUNSQL SQL('DELETE FROM UBLIBPR/SWCL06B02 WHERE ESTADO <> ''P''')
+RUNSQL SQL('DELETE FROM UBLIBPR/SWCL06B11 WHERE ESTADO <> ''P''')
 MONMSG CPF0000
