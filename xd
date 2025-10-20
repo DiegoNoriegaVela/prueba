@@ -1,5 +1,20 @@
-/* Quita cualquier registro que no sea 'P' en las salidas del día */
-RUNSQL SQL('DELETE FROM UBLIBPR/SWCL06B01 WHERE ESTADO <> ''P''')
-RUNSQL SQL('DELETE FROM UBLIBPR/SWCL06B02 WHERE ESTADO <> ''P''')
-RUNSQL SQL('DELETE FROM UBLIBPR/SWCL06B11 WHERE ESTADO <> ''P''')
+/* --- Sanea el plan del día UBLIBPR/SWCF63 --------------------------- */
+/* Mantén solo PANes emitidos (ESTADO='E') y con bloqueo permitido.    */
+/* Permite CODBLQ='A' únicamente para BINes TW/MP (090200,090900).     */
+
+RUNSQL SQL('
+  DELETE FROM UBLIBPR/SWCF63 P
+   WHERE NOT EXISTS (
+     SELECT 1
+       FROM UBLIBPR/SWCF01 F
+      WHERE F.NROPAN = P.NROPAN
+        AND F.ESTADO = ''E''
+        AND ( F.CODBLQ = ''O''
+              OR (F.CODBLQ = ''A''
+                  AND SUBSTR(DIGITS(P.NROPAN),1,6) IN (''090200'',''090900'')
+                 )
+            )
+   )
+');
 MONMSG CPF0000
+/* ------------------------------------------------------------------- */
