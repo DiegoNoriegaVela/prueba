@@ -1,101 +1,67 @@
 flowchart LR
-  %% === Estilos básicos ===
+  %% Estilos
   classDef prog fill:#1f77b4,stroke:#0b3d91,color:#fff,rx:5,ry:5
   classDef cl fill:#2ca02c,stroke:#1f5f1f,color:#fff,rx:5,ry:5
   classDef store fill:#fff,stroke:#666,color:#222,rx:4,ry:4,stroke-width:1.2px
-  classDef ext fill:#f2f2f2,stroke:#999,color:#444,rx:4,ry:4,stroke-dasharray:3 3
   classDef important fill:#fff9e6,stroke:#d4a106,color:#222,rx:4,ry:4,stroke-width:1.6px
 
-  %% === Programas con numeración y descripción simple ===
-  C1[1 - SWCC935B cl<br/>Orquestador de conciliacion y envio]:::cl
-  P2[2 - SWCR935 rpg<br/>Compara staging y genera diferencias]:::prog
-  P3[3 - SWCR936 rpg<br/>Traduce diferencias a transacciones y prepara envio]:::prog
-  P4[4 - SWCR929 rpg<br/>Arma tramas y envia a colas del switch]:::prog
-  P5[5 - UNI00601BW rpg<br/>Construye archivo UNIBATCH del dia]:::prog
+  %% Programas
+  P1[1 - SWCC600 cl<br/>Orquestador diario de emboce]:::cl
+  P2[2 - PLTDP85 cl<br/>Limpia tarjetas emitidas no activadas]:::prog
+  P3[3 - SWCC903B cl<br/>Asigna cdr a innominadas desde valorados]:::prog
+  P4[4 - SUBCMNU SWCR120<br/>Genera innominadas del dia]:::prog
+  P5[5 - SWCC950 cl<br/>Genera salidas tw mp masivas]:::prog
+  P6[6 - SWCC966 cl<br/>Envio relacion ew a courier]:::prog
+  P6b[6b - SWCC967 cl<br/>Variante mc procesos]:::prog
+  P7[7 - SWCC930 cl<br/>Genera orden de emboce]:::cl
+  R7a[7a - SWCR930 rpg<br/>Construye plan y marca estado]:::prog
+  P8[8 - PLWCP312 rpg<br/>Calcula fecha de vencimiento td]:::prog
+  P9[9 - SWCC996 cl<br/>Cierres y tareas eventuales]:::prog
 
-  %% === Tablas con descripciones breves ===
-  T1[TABCARD<br/>Tarjetas base MAD]:::store
-  T2[TABPAN<br/>Relaciones pan y cuenta MAD]:::store
+  %% Tablas y archivos
+  W1[LIBBD SWCF63<br/>Orden de emboce en trabajo]:::important
+  T1[UBLIBPR SWCF63<br/>Plan del dia para emboce]:::important
+  T2[LIBPF LTDD23<br/><br/> EMBOCE]:::important
+  T3[UBLIBPR SWCH63<br/>Historico de ordenes de emboce]:::important
+  F1[UBLIBPR SWCF01<br/>Maestra de tarjeta con estado y bloqueo]:::important
+  F2[SWCF63R<br/>Registros construidos por rpg]:::store
 
-  S1[SUBF01S<br/>Staging tarjetas del dia]:::store
-  S2[SUBF02S<br/>Staging cuentas del dia]:::store
+  %% Flujo
+  P1 -->|CALL| P2
+  P2 -->|WRITE depura| F1
 
-  R1[SUBF01R<br/>Resultado diferencias por tarjeta]:::store
-  R2[SUBF02R<br/>Resultado diferencias por cuenta]:::store
+  P1 -->|CALL| P3
+  P3 -->|WRITE prepara| F1
 
-  B0[SWCF06<br/>Registro maestro de envio del dia]:::store
-  B1[SWCL06B01<br/>Buffer dia operaciones]:::store
-  B2[SWCL06B02<br/>Buffer dia operaciones]:::store
-  B3[SWCL06B11<br/>Buffer dia varios]:::store
+  P1 -->|CALL| P4
+  P4 -->|WRITE crea base innominadas| F1
 
-  U1[ESP62D UNIBATCH<br/>Archivo batch para el switch]:::store
+  P1 -->|CALL| P5
 
-  %% Tablas usadas por SWCR929
-  F1[SWCF01<br/>Maestra de tarjeta con estado y bloqueo<br/>IMPORTANTE EMBOCE]:::important
-  F2[SUBF01<br/>Vista o apoyo tarjeta]:::store
-  F3[SUBF21<br/>Datos adicionales tarjeta]:::store
-  F4[SUBF40<br/>Tablas de codigos y descripciones]:::store
-  F5[SWCF102<br/>Datos auxiliares de tarjeta]:::store
-  F6[FST00101<br/>Parametros varios]:::store
-  F7[SWCL0611<br/>Guia por trace y fecha]:::store
-  F8[LPTAD871<br/>Parametros de estados y mapeos]:::store
-  LG[UNI41LAH<br/>Log de seguimiento]:::store
+  P1 -->|CALL| P6
+  P1 -->|CALL| P6b
 
-  %% Externos
-  DQ[Colas de datos UNI006DQ UNI007DQ UNI008DQ]:::ext
-  EXT1[PLWCP929<br/>Modulo externo de envio]:::ext
+  %% Generacion de la orden de emboce
+  P1 -->|CALL| P7
+  P7 -->|CALL| R7a
 
-  %% === Flujo detallado con acciones READ CALL WRITE ===
+  %% Construccion del plan por el rpg
+  R7a -->|READ datos de tarjeta| F1
+  R7a -->|WRITE| F2
+  R7a -->|WRITE orden en trabajo| W1
+  R7a -->|WRITE actualiza estado e| F1
 
-  %% 1 SWCC935B carga staging
-  C1 -->|READ| T1
-  C1 -->|READ| T2
-  C1 -->|WRITE CPYF| S1
-  C1 -->|WRITE CPYF| S2
+  %% Publicacion del plan del dia y salidas
+  P7 -->|WRITE cpyf reemplaza| T1
+  P7 -->|WRITE cpyf reemplaza| T2
+  P7 -->|WRITE cpyf add| T3
 
-  %% 2 Llama conciliacion
-  C1 -->|CALL| P2
-  P2 -->|READ| S1
-  P2 -->|READ| S2
-  P2 -->|WRITE| R1
-  P2 -->|WRITE| R2
+  %% Post embose
+  P1 -->|CALL| P8
+  P8 -->|WRITE actualiza vencimientos| F1
 
-  %% 3 Overrides de buffers del dia para el envio
-  C1 -. OVRDBF SWCF06 a SWCL06B .- P3
-  C1 -. OVRDBF SWCL0601 a SWCL06B01 .- P3
-  C1 -. OVRDBF SWCL0602 a SWCL06B02 .- P3
-  C1 -. OVRDBF SWCL0611 a SWCL06B11 .- P3
-
-  %% 3 Genera transacciones y prepara envio
-  C1 -->|CALL| P3
-  P3 -->|READ| R1
-  P3 -->|READ| R2
-  P3 -->|WRITE| B0
-  P3 -->|WRITE via overrides| B1
-  P3 -->|WRITE via overrides| B2
-  P3 -->|WRITE via overrides| B3
-  P3 -->|CALL| P4
-
-  %% 4 Arma tramas y envia por DTAQ
-  P4 -->|READ guia| F7
-  P4 -->|READ| F1
-  P4 -->|READ| F2
-  P4 -->|READ| F3
-  P4 -->|READ| F4
-  P4 -->|READ| F5
-  P4 -->|READ| F6
-  P4 -->|READ| F8
-  P4 -->|WRITE log| LG
-  P4 -->|CALL| EXT1
-  P4 -->|WRITE QSNDDTAQ| DQ
-
-  %% 5 Construye UNIBATCH desde buffers del dia
-  C1 -->|CALL| P5
-  P5 -->|READ| B1
-  P5 -->|READ| B2
-  P5 -->|READ| B3
-  P5 -->|WRITE| U1
+  P1 -->|CALL| P9
 
   %% Clases
-  class C1 cl
-  class P2,P3,P4,P5 prog
+  class P1,P7 cl
+  class P2,P3,P4,P5,P6,P6b,P8,P9,R7a prog
