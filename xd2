@@ -1,0 +1,139 @@
+SWCC600 CL - Orquestador diario de embosado 
+Objetivo / Rol
+Coordina el ciclo diario de embosado según CL: prepara, depura, genera la orden de embose y publica los archivos del día.
+Inputs
+•	Fecha de proceso: RTVJOBA / CHGJOB / CVTDAT → &FECHA (YYMD sin separador).
+•	Maestra de tarjeta: UBLIBPR/SWCF01 (usada por el RPG invocado en el paso de embose).
+•	Programas llamados por SWCC600:
+o	PLTDP85
+o	SWCC903B &FECHA '999'
+o	SUBCMNU 'SWCR120'
+o	SWCC950 &FECHA
+o	SWCC966 &FECHA
+o	SWCC967 &FECHA
+o	SWCC930 &FECHA (este llama al RPG SWCR930)
+o	PLWCP312
+o	SWCC996
+Outputs
+•	UBLIBPR/SWCF63 (plan del día): vía CPYF REPLACE desde &LIBBD/SWCF63R (según tu diagrama/flujo).
+•	UBLIBPR/SWCH63 (histórico): vía CPYF ADD desde &LIBBD/SWCF63R.
+•	&LIBPF/LTDD23: vía CPYF REPLACE desde UBLIBPR/SWCF63 con FMTOPT(*NOCHK).
+Detalle de funcionamiento (paso a paso)
+1.	Inicializa fecha
+RTVJOBA / CHGJOB / CVTDAT → &FECHA.
+2.	Depura previos
+CALL PLTDP85.
+3.	Prepara innominadas (valorados)
+CALL SWCC903B &FECHA '999'.
+4.	Genera base de innominadas
+CALL SUBCMNU 'SWCR120'.
+5.	Genera salidas TW/MP/Masivas
+CALL SWCC950 &FECHA.
+6.	Relación de envío (courier)
+CALL SWCC966 &FECHA
+CALL SWCC967 &FECHA.
+7.	Orden de embose
+CALL SWCC930 &FECHA
+o	SWCC600 llama SWCC930 (CL), que a su vez llama SWCR930 (este RPG) para construir SWCF63R.
+o	Dentro de este flujo: SWCR930 (RPG) arma los registros de embose del día (trabaja contra SWCF01 y construye &LIBBD/SWCF63R / &LIBBD/SWCF63 en la librería de trabajo).
+o	Copias para publicar el plan en UBLIBPR y acumular en histórico:
+	CPYF REPLACE &LIBBD/SWCF63R → UBLIBPR/SWCF63
+	CPYF REPLACE UBLIBPR/SWCF63 → &LIBPF/LTDD23 FMTOPT(*NOCHK)
+	CPYF ADD &LIBBD/SWCF63R → UBLIBPR/SWCH63
+8.	Ajuste de vencimientos
+CALL PLWCP312.
+9.	Cierre/eventuales
+CALL SWCC996.
+SWCR930 RPG - Construcción de la orden de embosado (plan del día)
+Objetivo / Rol
+Leer la maestra de tarjetas y armar los registros del plan de embose del día en un archivo de trabajo, para que el CL (SWCC930→ llamado por SWCC600) luego publique ese plan.
+Inputs
+•	Parámetro de fecha: el CL (SWCC930) le pasa &FECHA del proceso.
+•	Maestra de tarjeta: UBLIBPR/SWCF01 (contiene estado, bloqueo y datos base de la tarjeta).
+Outputs (observados)
+•	&LIBBD/SWCF63R: orden de embosado construida (archivo de trabajo del día).
+Luego, el CL SWCC930 hace los CPYF:
+SWCF63R → UBLIBPR/SWCF63 (plan del día), y ADD a UBLIBPR/SWCH63 (histórico).
+Detalle de funcionamiento
+1.	Inicializa con la fecha de proceso recibida.
+2.	Lee la maestra SWCF01 tarjeta por tarjeta.
+3.	Aplica reglas de elegibilidad para embose (según los campos de estado/bloqueo y otros datos disponibles en la maestra).
+El filtrado ocurre sobre SWCF01; el archivo de salida del plan (SWCF63R) solo contiene filtrado.
+4.	Por cada tarjeta elegible, arma un registro del plan (SWCF63R): PAN, datos de producto …
+5.	Graba (WRITE) los registros a &LIBBD/SWCF63R.
+6.	El CL SWCC930 se encarga después de publicar:
+o	REPLACE a UBLIBPR/SWCF63 (plan del día)
+o	ADD a UBLIBPR/SWCH63 (histórico)
+o	(y la otra copia que aparece en tu flujo hacia &LIBPF/LTDD23 con FMTOPT(*NOCHK)).
+
+
+>=============
+flowchart LR
+  %% ===== Estilos =====
+  classDef prog fill:#1f77b4,stroke:#0b3d91,color:#fff,rx:6,ry:6
+  classDef cl fill:#2ca02c,stroke:#1f5f1f,color:#fff,rx:6,ry:6
+  classDef store fill:#fff,stroke:#666,color:#222,stroke-width:1.4px
+  classDef important fill:#fff9e6,stroke:#d4a106,color:#222,stroke-width:1.6px,rx:6,ry:6
+  classDef ext fill:#f2f2f2,stroke:#999,color:#444,rx:6,ry:6,stroke-dasharray:4 3
+  classDef opt fill:#eef7ff,stroke:#5aa0e6,color:#123,rx:6,ry:6
+
+  %% ===== Programas =====
+  C0[0 - SWCC600 cl<br/>Orquestador diario de embosado]:::cl
+  P1[1 - PLTDP85 cl<br/>Depura: TD emitidas no activadas]:::prog
+  P2[2 - SWCC903B cl<br/>Prepara innominadas -valorados]:::prog
+  P3[3 - SUBCMNU 'SWCR120'<br/>Genera innominadas del día]:::prog
+  P4[4 - SWCC950 cl<br/>Salidas TW / MP / Masivas]:::opt
+  P5[5 - SWCC966 cl<br/>Relación EW a courier]:::opt
+  P5b[5b - SWCC967 cl<br/>Variante MC-procesos]:::opt
+  P6[6 - SWCC930 cl<br/>Publica orden de embosado]:::cl
+  R6[6a - SWCR930 rpg<br/>Construye plan del día y marca estado]:::prog
+  P7[7 - PLWCP312 rpg<br/>Actualiza fecha de vencimiento TD]:::prog
+  P8[8 - SWCC996 cl<br/>Cierres / tareas eventuales]:::prog
+
+  %% ===== Tablas ([(...)]) =====
+  M1[(UBLIBPR/SWCF01<br/>Maestra de tarjeta: estado / bloqueo)]:::important
+
+  W63R[(&LIBBD/SWCF63R<br/>Plan generado por RPG detalle)]:::store
+
+  P63[(UBLIBPR/SWCF63<br/>Plan del día para embosado)]:::important
+  LT23[(&LIBPF/LTDD23<br/>Archivo de salida hacia host/MVS)]:::important
+  H63[(UBLIBPR/SWCH63<br/>Histórico de planes de embosado)]:::important
+
+  %% ===== Flujo SWCC600 =====
+  C0 -->|CALL| P1
+  P1 -->|WRITE depura| M1
+
+  C0 -->|CALL| P2
+  P2 -->|WRITE prepara| M1
+
+  C0 -->|CALL| P3
+
+  %% Pasos opcionales (según día)
+  C0 -->|CALL opcional| P4
+  C0 -->|CALL opcional| P5
+  C0 -->|CALL opcional| P5b
+
+  %% Generación y publicación de la orden de embosado
+  C0 -->|CALL| P6
+  P6 -->|CALL| R6
+
+  %% SWCR930 construye plan y actualiza estado
+  R6 -->|READ| M1
+  R6 -->|WRITE| W63R
+  R6 -->|WRITE marca ESTADO='E'| M1
+
+  %% Publicación del plan del día (CPYF ejecutado por SWCC930)
+  W63R -.->|CPYF REPLACE &LIBBD/SWCF63R → UBLIBPR/SWCF63| P63
+  P63  -.->|CPYF REPLACE UBLIBPR/SWCF63 → &LIBPF/LTDD23  - FMTOPT *NOCHK| LT23
+  W63R -.->|CPYF ADD     &LIBBD/SWCF63R → UBLIBPR/SWCH63| H63
+
+  %% Post-embosado
+  C0 -->|CALL| P7
+  P7 -->|WRITE actualiza vencimientos| M1
+
+  C0 -->|CALL| P8
+
+  %% Clases
+  class C0,P6 cl
+  class P1,P2,P3,P4,P5,P5b,P7,P8,R6 prog
+  class M1,P63,LT23,H63 important
