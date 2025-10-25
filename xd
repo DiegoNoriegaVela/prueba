@@ -1,100 +1,280 @@
+SWCC935B.cl - Orquestador del día para conciliar tarjetas AS400 y switch
+Objetivo / Rol
+Coordinar el ciclo diario de tarjetas para conciliar lo del servidor AS400 con el switch. Tomando como regla básica que lo que manda es lo del AS400.
+Inputs
+•	Maestros: UBLIBPR/TABCARD (tarjetas), UBLIBPR/TABPAN (PAN-cuenta).
+Outputs
+•	Staging: UBLIBPR/SUBF01S, UBLIBPR/SUBF02S.
+•	Diferencias (SWCR935): UBLIBPR/SUBF01R, UBLIBPR/SUBF02R.
+•	Operaciones del día (SWCR936): UBLIBPR/SWCF06.
+•	Batch: ESP62D/UNIBATCH (UNI00601BW).
+Detalle de funcionamiento
+1.	Copia a staging (CPYF)
+o	Toma los maestros del día y arma la “foto” de trabajo:
+	UBLIBPR/TABCARD → UBLIBPR/SUBF01S (tarjetas)
+	UBLIBPR/TABPAN → UBLIBPR/SUBF02S (relación PAN–cuenta)
+2.	Conciliación (CALL SWCR935)
+o	Compara stage vs. referencia y genera diferencias:
+	UBLIBPR/SUBF01R (tarjeta, CODERR 100x)
+	UBLIBPR/SUBF02R (cuenta–tarjeta, CODERR 200x)
+3.	Preparación de envío (CALL SWCR936)
+o	Traduce CODERR → CODTRA (operaciones del switch)
+o	Registra el plan de envío del día en UBLIBPR/SWCF06
+o	Llama a SWCR929 para replicar (enviar a colas del switch)
+	SWCR929: Con el trace, arma la trama y la envía a las data queues del switch.
+4.	Batch diario (CALL UNI00601BW)
+o	Construye el ESP62D/UNIBATCH con el consolidado del día.
+SWCR935.rpg - Conciliación (staging vs. maestros)
+Objetivo / Rol
+Detectar desalineaciones entre las fotos del día (staging) y los maestros operativos, y emitir un listado de diferencias por tarjeta y por cuenta‐tarjeta.
+El resultado son registros con CODERR que el siguiente programa (SWCR936) convertirá en transacciones del switch.
+Inputs
+•	UBLIBPR/SUBF01S: staging tarjetas del día (foto MAD).
+•	UBLIBPR/SUBF02S: staging cuentas por tarjeta del día (foto MAD).
+•	UBLIBPR/SUBF01: maestro/vista tarjetas (lado SUN).
+•	UBLIBPR/SUBF02: maestro/vista cuentas por tarjeta (lado SUN).
+•	UBLIBPR/SWCF21: guía del día (apoyo para innominadas).
+Convención usada en el código: “S” = staging/MAD, sin “S” = maestro/SUN.
+Outputs
+•	UBLIBPR/SUBF01R: diferencias a nivel tarjeta (incluye CODERR).
+•	UBLIBPR/SUBF02R: diferencias a nivel cuenta–tarjeta (incluye CODERR).
+•	Contadores por código (subrutina COUNT_REC): ER101..ER104, ER201..ER203.
+Detalle de funcionamiento
+1.	Tarjetas (SUB_TARJETA / SUB_TARJETA1):
+Recorre la foto del día (SUBF01S), contrasta contra el maestro (SUBF01) y registra 100x en SUBF01R cuando detecta alta/falta, pendientes/innominadas, o desalineaciones de bloqueo/estado, offset, PIN, etc.
+2.	Cuentas por tarjeta (SUB_TAR_CTA / SUB_TAR_CTA1):
+Recorre la foto del día (SUBF02S), compara con el maestro (SUBF02) y registra 200x en SUBF02R para afiliar cuentas que faltan, actualizar atributos de cuentas (sólo si la tarjeta está Activa/Pendiente) o marcar inconsistencias de estado/tipo.
+3.	Innominadas:
+Usa SWCF21 como guía y también genera diferencias (1002).
+4.	Resumen:
+Cada registro de salida lleva NROPAN (y NROCTA en cuentas) y el CODERR que describe la acción sugerida.
+Significado de cada CODERR
+100x — Diferencias de tarjeta (se emiten en SUBF01R)
+•	1001 – Existe a un lado y falta al otro.
+Tarjeta visible en un sistema y ausente en el otro (desalineación de existencia).
+→ Caso típico de alta/falta a regularizar.
+•	1002 – Pendiente/innominada a regularizar.
+Tarjeta pendiente/innominada detectada por la guía del día; requiere creación/regularización.
+•	1003 – Bloqueo/estado no coinciden.
+El bloqueo/estado de la tarjeta SUN vs. MAD difiere (p. ej. A/P/O vs. lo esperado).
+•	1004 – OFFSET inválido.
+OFFSET en ceros/blancos; debe corregirse antes del envío.
+•	1005 – PIN/PINOFF inconsistente.
+PINOFF en ceros/blancos con condiciones que lo vuelven inválido; requiere corrección.
+•	1006 – Secuencia forzada: activar y luego bloquear.
+Caso que exige primero activar y después ejecutar el bloqueo en el switch.
+200x — Diferencias de cuenta–tarjeta (se emiten en SUBF02R)
+•	2001 – Afiliación que falta.
+La relación PAN–cuenta no existe en el maestro; hay que crear/afiliar la cuenta a la tarjeta.
+•	2002 – Actualizar atributos de cuenta (sólo A/P).
+Para tarjetas Activas o Pendientes, se detecta cambio de atributos (moneda, tipo, flags, etc.) y se debe actualizar la relación.
+•	2003 – Inconsistencias de estado/tipo de cuenta.
+Combinaciones inválidas entre FIRSTC, FIRACC y TIPOCT1; requieren ajuste de la relación en el switch.
+SWCR936 (RPG) - Preparación de envío (mapea CODERR → CODTRA)
+Objetivo / Rol
+Tomar las diferencias que dejó el SWCR935 (código CODERR) y convertirlas en operaciones concretas del switch (CODTRA).
+Registra esas operaciones en SWCF06 y dispara la réplica llamando a SWCR929.
+Inputs
+•	UBLIBPR/SUBF01R: diferencias por tarjeta (con CODERR).
+•	UBLIBPR/SUBF02R: diferencias por cuenta–tarjeta (con CODERR).
+Outputs
+•	UBLIBPR/SWCF06: lista de operaciones del día listas para replicar.
+•	CALL SWCR929: ejecución de la réplica hacia el switch (envío por data queue).
+Detalle de funcionamiento
+1.	Lee SUBF01R (tarjetas) y traduce cada CODERR 100x a un CODTRA:
+o	1001 → 600 (emitir/crear tarjeta).
+o	1002 → 600 (regularizar pendiente/innominada).
+o	1003 → 604 (ajustar estado/bloqueo / otros datos).
+o	1004 → 604 (corrección de OFFSET).
+o	1005 → 604 (corrección de PIN/PINOFF).
+o	1006 → secuencia: 605 (activar) y luego 604 (bloquear).
+2.	Lee SUBF02R (cuentas por tarjeta) y traduce cada CODERR 200x a códigos de cuenta del catálogo del switch:
+o	2001 → afiliar/crear relación de cuenta (220 o 204).
+o	2002 → actualizar atributos (229, …).
+o	2003 → corregir inconsistencia de estado/tipo
+La equivalencia exacta de CODTRA para cuentas está parametrizada en tabla (SUBF40). El 936 aplica estas reglas enviando a SWCR929:
+3.	Por cada traducción, graba una fila en SWCF06: Incluye CODTRA, NROPAN (y NROCTA si aplica), fecha/hora/trace y datos de control según SWCF06.
+4.	Tras registrar, llama a SWCR929 y le pasa el trace y la fecha para replicar: El 929 mira su tabla de códigos (SUBF40) y ejecuta la rutina que corresponde al CODTRA (emitir, activar, bloquear, afiliar, etc.), y envía la trama a las data queues del switch.
+SWCR929 (RPG) - Réplica al switch/SLM (envío por data queues)
+Objetivo / Rol
+Tomar el trace (enviado por el 936), recuperar la guía del día (SWCL0611) para saber qué transacción (CODTRA) se debe emitir y a qué cola va, armar la trama con datos de tarjeta/cuenta y envia a las data queues del switch.
+Opcionalmente logea en UNI41LAH, registra log opcional y ejecuta rutinas auxiliares (texto de emboce, mapeo de bloqueos, SMS Card Security).
+Inputs
+•	Parámetros:
+PTRACE (trace a procesar), PTIPO (modo/flag de envío; ‘S’ habilita SMS y se normaliza a ‘0’ para PTIPO), PCODRE (código de retorno).
+•	Guía por trace: UBLIBPR/SWCL0611 (trace + fecha).
+Desde aquí se lee el CODTRA y otros campos de control de la operación.
+•	Maestros/soporte (según rutina):
+o	UBLIBPR/SWCF01, SUBF01, SUBF21, SWCF102, FST00101 (datos de tarjeta/cuenta/persona).
+o	UBLIBPR/SUBF40 (tabla de códigos: mapea CODTRA → rutina del 929 y define cola).
+o	UBLIBPR/LPTAD871 (parámetros/guías para mapeo de bloqueos y estados).
+•	Configuración:
+o	PLCTP403 → FLGLOG (si se graba log).
+o	PLWVP105 → código de banco (para identificar institución).
+o	Subrutina CARGAARR → carga arreglos de estados/bloqueos desde LPTAD871.
+Outputs
+•	Envío a data queues:
+ESP62E/UNI006DQ, ESP62E/UNI007DQ o ESP62E/UNI008DQ.
+(Se utiliza QSNDDTAQ para depositar la trama construida).
+•	Log opcional en UNI41LAH cuando FLGLOG='S' (subrutina CARLOG).
+•	Llamadas auxiliares:
+o	PLWVP88D (Card Security/SMS) para ciertos CODTRA (p. ej. 604/606/607/624) cuando aplica.
+Detalle de funcionamiento
+1.	Inicialización
+o	Lee parámetros y normaliza PTIPO (si viene ‘S’, lo guarda en un flag y deja PTIPO='0').
+o	Pide FLGLOG a PLCTP403 (grupo LOGSWT).
+o	Determina código de banco con PLWVP105.
+o	CARGAARR: llena arreglos de estados/bloqueos desde LPTAD871.
+2.	Contexto de fecha/trace
+o	Arma FECHACT (fecha en char) y CFECHA a partir de la fecha del trace (FECTRA).
+3.	Localiza la guía del trace
+o	SETLL/READE en SWCL0611 con (trace, año, mes, día).
+o	Si existe y la flag de la guía no impide el envío (ej. FLGFNA <> 'A'), continua.
+4.	Selecciona la rutina a ejecutar (según CODTRA)
+o	Mira SUBF40 (grupo 794) para mapeo CODTRA → WRUTINA y cola (WCOLA).
+o	Carga cabeceras/terminal/online/batch en SCARGA.
+5.	Arma la trama (según rutina específica)
+o	Ejecuta la subrutina que corresponda (ejemplos más usados):
+	200 – SEMITE: emisión/creación de tarjeta (setea LAITT=200, usa NROPAN, BIN/emboss y datos base).
+	201 – SACTIVA: activa tarjeta (LAITT=201).
+	222 – SBLOQUEO: mapea CODBLQ → código del switch con ARR1..ARR4 (según TC/TD) y setea LATRK.
+	204 – SAFILIA / 205 – SDESAFILIA: alta/baja de relación cuenta–tarjeta (llena LACTA/LACMB etc.).
+	220 – SCUENTA: crea cuenta en el switch (moneda, tipo, institución, máscaras).
+	229 – SSALDOS / 227 – SCONS ALDO: consultas de saldos (rutina especial: va a UNI008DQ).
+	230 – SCAMBIO: línea de cambio / parámetros de tarjeta.
+	231 – SPVV: primer PVV (LAPOF).
+	235 – SBOTONES: actualización de “botones”.
+	203 – SCONSULTA: consulta de tarjeta.
+6.	Envía la trama a la cola
+o	GRABADTAQ: mueve la trama (VTRAMA → DMENSA) y la envía a:
+	UNI006DQ por defecto,
+	UNI007DQ si WCOLA='2',
+	UNI008DQ si WRUTINA=229 (caso saldos).
+o	Si FLGLOG='S', graba UNI41LAH con hora/usuario/trace/pan/cuenta/códigos.
+7.	Acción adicional (Card Security)
+o	Si CODTRA {604, 606, 607, 624} y CODBLQ diferente de 'A' y PTIPO='S', llama PLWVP88D para notificación/SMS.
+8.	Retorno
+o	Ajusta PCODRE si no halló el trace/guía o ante situaciones de no envío.
+o	Finaliza (para masivos no apaga LR).
+
+========================
 flowchart LR
-  %% === Estilos ===
-  classDef prog fill:#1f77b4,stroke:#0b3d91,color:#fff,rx:5,ry:5
-  classDef cl fill:#2ca02c,stroke:#1f5f1f,color:#fff,rx:5,ry:5
-  classDef store fill:#fff,stroke:#666,color:#222,rx:4,ry:4,stroke-width:1.2px
-  classDef ext fill:#f2f2f2,stroke:#999,color:#444,rx:4,ry:4,stroke-dasharray:3 3
-  classDef important fill:#fff9e6,stroke:#d4a106,color:#222,rx:4,ry:4,stroke-width:1.6px
+  %% ===== Estilos =====
+  classDef prog fill:#1f77b4,stroke:#0b3d91,color:#fff,rx:6,ry:6
+  classDef cl fill:#2ca02c,stroke:#1f5f1f,color:#fff,rx:6,ry:6
+  classDef store fill:#fff,stroke:#666,color:#222,stroke-width:1.4px
+  classDef ext fill:#f2f2f2,stroke:#999,color:#444,rx:6,ry:6,stroke-dasharray:4 3
 
-  %% === Programas con numeración y descripción simple ===
-  C1[1 - SWCC935B cl<br/>Orquestador de conciliacion y envio]:::cl
-  P2[2 - SWCR935 rpg<br/>Compara staging y genera diferencias]:::prog
-  P3[3 - SWCR936 rpg<br/>Traduce diferencias a transacciones y prepara envio]:::prog
-  P4[4 - SWCR929 rpg<br/>Arma tramas y envia a colas del switch]:::prog
-  P5[5 - UNI00601BW rpg<br/>Construye archivo UNIBATCH del dia]:::prog
-  OV[OVRDBF redirige a buffers del dia<br/>SWCF06 -> UBLIBPR/SWCL06B<br/>SWCL0601 -> UBLIBPR/SWCL06B01<br/>SWCL0602 -> UBLIBPR/SWCL06B02<br/>SWCL0611 -> UBLIBPR/SWCL06B11]:::ext
+  %% ===== Programas principales =====
+  C1[1 - SWCC935B cl<br/>Orquestador del día: copia datos a staging CPYF, llama conciliación, arma transacciones y dispara envío; genera UNIBATCH]:::cl
+  P2[2 - SWCR935 rpg<br/>Conciliación: compara staging vs maestros y produce diferencias por TARJETA y CUENTA - CODERR 1001..1006, 2001..2003]:::prog
+  P3[3 - SWCR936 rpg<br/>Preparación de envío: lee diferencias, traduce a CODTRA -p.ej. 600/605/604, registra en SWCF06 y llama réplica]:::prog
+  P4[4 - SWCR929 rpg<br/>Réplica SLM]:::prog
+  P5[5 - UNI00601BW rpg<br/>Consolidación: genera archivo ESP62D/UNIBATCH del día para transmisión]:::prog
 
-  %% === Tablas con descripciones breves ===
-  T1[UBLIBPR/TABCARD<br/>Tarjetas base MAD]:::store
-  T2[UBLIBPR/TABPAN<br/>Relaciones pan y cuenta MAD]:::store
+  %% ===== Tablas ([(...)]) =====
+  T1[(UBLIBPR/TABCARD<br/>Tarjetas base del MAD: alto nivel de tarjeta)]:::store
+  T2[(UBLIBPR/TABPAN<br/>Relación PAN–Cuenta del MAD)]:::store
 
-  S1[UBLIBPR/SUBF01S<br/>Staging tarjetas del dia]:::store
-  S2[UBLIBPR/SUBF02S<br/>Staging cuentas del dia]:::store
+  S1[(UBLIBPR/SUBF01S<br/>Staging TARJETA del día para conciliación)]:::store
+  S2[(UBLIBPR/SUBF02S<br/>Staging CUENTA del día para conciliación)]:::store
 
-  R1[UBLIBPR/SUBF01R<br/>Resultado diferencias por tarjeta]:::store
-  R2[UBLIBPR/SUBF02R<br/>Resultado diferencias por cuenta]:::store
+  R1[(UBLIBPR/SUBF01R<br/>Resultado: diferencias por TARJETA con CODERR)]:::store
+  R2[(UBLIBPR/SUBF02R<br/>Resultado: diferencias por CUENTA con CODERR)]:::store
 
-  B0[UBLIBPR/SWCF06<br/>Registro maestro de envio del dia]:::store
-  B1[UBLIBPR/SWCL06B01<br/>Buffer dia operaciones]:::store
-  B2[UBLIBPR/SWCL06B02<br/>Buffer dia operaciones]:::store
-  B3[UBLIBPR/SWCL06B11<br/>Buffer dia varios]:::store
+  B0[(UBLIBPR/SWCF06<br/>Maestro de envío del día operaciones a replicar)]:::store
+  U1[(ESP62D/UNIBATCH<br/>Archivo batch consolidado para el switch)]:::store
 
-  U1[ESP62D/UNIBATCH<br/>Archivo batch para el switch]:::store
-
-  %% Tablas usadas por SWCR929
-  F1[UBLIBPR/SWCF01<br/>Maestra tarjeta con estado y bloqueo<br/>]:::important
-  F2[UBLIBPR/SUBF01<br/>Vista o apoyo tarjeta]:::store
-  F3[UBLIBPR/SUBF21<br/>Datos adicionales tarjeta]:::store
-  F4[UBLIBPR/SUBF40<br/>Tablas de codigos y descripciones]:::store
-  F5[UBLIBPR/SWCF102<br/>Datos auxiliares de tarjeta]:::store
-  F6[UBLIBPR/FST00101<br/>Parametros varios]:::store
-  F7[UBLIBPR/SWCL0611<br/>Guia por trace y fecha]:::store
-  F8[UBLIBPR/LPTAD871<br/>Parametros de estados y mapeos]:::store
-  LG[UNI41LAH<br/>Log de seguimiento]:::store
-
-  %% Externos
-  DQ[Colas de datos ESP62E UNI006DQ UNI007DQ UNI008DQ]:::ext
-  EXT1[PLWCP929<br/>Modulo externo de envio]:::ext
-
-  %% === Flujo detallado con acciones READ CALL WRITE ===
-
-  %% 1 SWCC935B carga staging con CPYF
+  %% ===== Flujo SWCC935B =====
+  %% 1) Carga staging (CPYF explícito)
   C1 -->|READ| T1
   C1 -->|READ| T2
-  T1 -->|CPYF| S1
-  T2 -->|CPYF| S2
+  T1 -->|CPYF → UBLIBPR/SUBF01S| S1
+  T2 -->|CPYF → UBLIBPR/SUBF02S| S2
 
-  %% 2 Llama conciliacion
+
+  %% 2) Conciliación
   C1 -->|CALL| P2
   P2 -->|READ| S1
   P2 -->|READ| S2
   P2 -->|WRITE| R1
   P2 -->|WRITE| R2
 
-  %% Overrides agrupados
-  C1 --> OV
-  OV --> P3
-
-  %% 3 Genera transacciones y prepara envio
+  %% 3) Genera transacciones y prepara envío
   C1 -->|CALL| P3
   P3 -->|READ| R1
   P3 -->|READ| R2
-  P3 -->|WRITE| B0
-  P3 -->|WRITE override| B1
-  P3 -->|WRITE override| B2
-  P3 -->|WRITE override| B3
-  P3 -->|CALL| P4
+  P3 -->|WRITE SWCF06R| B0
+  P3 -->|CALL| P4   
+  %% (solo mención del 929)
 
-  %% 4 Arma tramas y envia por DTAQ
-  P4 -->|READ guia| F7
-  P4 -->|READ| F1
-  P4 -->|READ| F2
-  P4 -->|READ| F3
-  P4 -->|READ| F4
-  P4 -->|READ| F5
-  P4 -->|READ| F6
-  P4 -->|READ| F8
-  P4 -->|WRITE log| LG
-  P4 -->|CALL| EXT1
-  P4 -->|WRITE QSNDDTAQ| DQ
-
-  %% 5 Construye UNIBATCH desde buffers del dia
+  %% 4) UNI00601BW (confirmado por tus capturas)
   C1 -->|CALL| P5
-  P5 -->|READ| B1
-  P5 -->|READ| B2
-  P5 -->|READ| B3
   P5 -->|WRITE| U1
 
   %% Clases
   class C1 cl
   class P2,P3,P4,P5 prog
+
+=====================
+
+flowchart LR
+  %% ===== Estilos simples y legibles =====
+  classDef paso fill:#2ca02c,stroke:#1f5f1f,color:#fff,rx:6,ry:6
+  classDef proc fill:#1f77b4,stroke:#0b3d91,color:#fff,rx:6,ry:6
+  classDef tabla fill:#fff,stroke:#666,color:#222,stroke-width:1.4px,rx:6,ry:6
+  classDef ext fill:#f2f2f2,stroke:#999,color:#444,rx:6,ry:6,stroke-dasharray:4 3
+
+  %% ===== Programa =====
+  S0[1 - Inicio SWCR929<br/>Recibe: PTRACE, PTIPO, PCODRE<br/>Arma fecha de trabajo FECHACT]:::paso
+
+  %% ===== Parametría / guía =====
+  P1[2 - Carga parámetros básicos<br/>Logging, banco/entidad]:::paso
+  G1[(UBLIBPR/SWCL0611<br/>Guía por trace y fecha)]:::tabla
+
+  %% ===== Decidir qué operación enviar =====
+  S1[3 - Elegir operación<br/>según PTIPO/WRUTINA]:::paso
+
+  %% ===== Lectura de datos (lo mínimo necesario) =====
+  L0[4 - Leer datos necesarios<br/>de la tarjeta y su contexto]:::paso
+  T1[(UBLIBPR/SWCF01<br/>Tarjeta: estado y bloqueo)]:::tabla
+  T2[(UBLIBPR/SUBF01<br/>Apoyo de tarjeta)]:::tabla
+  T3[(UBLIBPR/SUBF21<br/>Datos adicionales)]:::tabla
+  T4[(UBLIBPR/SWCF102<br/>Auxiliares)]:::tabla
+
+  %% ===== Reglas puntuales (solo si aplica) =====
+  R0[5 - Reglas de negocio<br/>Ej.: validar estado/bloqueo, mapear codigos]:::paso
+
+  %% ===== Armar mensaje =====
+  M0[6 - Construir mensaje/trama<br/>con los campos que pide el switch]:::proc
+
+  %% ===== Envío =====
+  Q0[7 - Elegir cola de salida<br/>según la guía]:::paso
+  DQ[(ESP62E/UNI006DQ • UNI007DQ • UNI008DQ<br/>Colas de salida)]:::tabla
+
+  %% ===== Log (opcional) =====
+  LG[8 - Registrar log si está activo]:::paso
+  LGT[(UNI41LAH<br/>Log de seguimiento)]:::tabla
+
+  %% ===== Fin =====
+  FIN[9 - Fin<br/>Retorna al llamador]:::paso
+
+  %% ===== Conexiones =====
+  S0 --> P1
+  P1 --> G1
+  S0 --> S1
+  S1 --> L0
+
+  L0 --> T1
+  L0 --> T2
+  L0 --> T3
+  L0 --> T4
+
+  L0 --> R0
+  R0 --> M0
+  M0 --> Q0
+  Q0 --> DQ
+
+  M0 --> LG
+  LG --> LGT
+  M0 --> FIN
