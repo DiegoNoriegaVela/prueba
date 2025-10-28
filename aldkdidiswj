@@ -253,6 +253,7 @@ public class McBatchSender {
         }
 
         // ------------------- Opcion 2: Reporte (procesa) -------------------
+        // ------------------- Opcion 2: Descarga y genera reporte -------------------
         static void runReport(General g, Business b, String fileParam, String yyyymmdd) {
             logger.info("=== OPCION 2: Descarga y genera reporte ===");
             logger.info("Host: " + b.host + " Puerto: " + b.port);
@@ -261,7 +262,7 @@ public class McBatchSender {
             logger.info("Nombre base: " + base);
 
             boolean found = false;
-            String lastChunk = null;
+            StringBuilder rawAcc = new StringBuilder();
 
             try (Socket sock = new Socket()) {
                 sock.connect(new InetSocketAddress(b.host, b.port), g.connectTimeoutMs);
@@ -274,11 +275,12 @@ public class McBatchSender {
                     logger.info("Consultando: " + query);
                     writeFrameName(sock, query);
 
-                    // lectura legacy (como estaba), si quieres total, cambia a readResponse
+                    // lectura one-shot legacy y acumulación EXACTA como el original
                     String chunk = readLegacyOneShot(sock);
-                    lastChunk = chunk;
+                    rawAcc.setLength(0);
+                    rawAcc.append("[").append(chunk).append("]\n");
 
-                    if (hasAccepted(chunk, g.acceptedCode)) {
+                    if (hasAccepted(rawAcc.toString(), g.acceptedCode)) {
                         found = true;
                         break;
                     } else {
@@ -288,21 +290,23 @@ public class McBatchSender {
 
                 if (!found) {
                     logger.severe("*** Archivo no encontrado [FAIL]");
-                    logger.info("[Preview 80B] " + preview80(lastChunk));
-                    writeErrorDump(fileParam, yyyymmdd, lastChunk);
+                    String rr = rawAcc.toString(); // mantiene el formato con []
+                    logger.info("[Preview 80B] " + preview80(rr));
+                    writeErrorDump(fileParam, yyyymmdd, rr);
                     logger.info("=== FIN OPCION 2 ===");
                     return;
                 }
 
-                // Exito: procesar como legado (ordenar)
+                // Éxito: ordenar usando las mismas reglas del original (headers + details)
                 String dataToWrite;
                 try {
-                    dataToWrite = orderDetails(lastChunk, firstAcceptedOrDefault(g));
+                    dataToWrite = orderDetails(rawAcc.toString(), firstAcceptedOrDefault(g));
                 } catch (Exception ex) {
                     logger.severe("Error al ordenar; se guarda crudo");
-                    dataToWrite = lastChunk;
+                    dataToWrite = rawAcc.toString();
                 }
 
+                // escribir reporte con nombre original
                 writeReportFile(yyyymmdd, dataToWrite, fileParam);
                 logger.info("Reporte OK");
 
@@ -653,40 +657,62 @@ public class McBatchSender {
     }
 
     // Reordenamiento de detalles (mantener firma y logica original aproximada)
-    private static String orderDetails(String data, String allOkCode) {
-        if (data == null) return "";
-        String[] detailsData = data.split("D0");
-        if (detailsData.length == 0) return data;
+    // Compone el reporte como antes: encabezado + detalle ordenado
+    private static String orderDetails(String dataMipDato, String allOkCode) {
+        String headers = extractHeaders(dataMipDato);
+        String details = extractDetails(dataMipDato, allOkCode);
+        return headers + details;
+    }
+
+    // Encabezado EXACTO: "[<nombre>]\n" + bloque entre "12" y el primer "16"
+    private static String extractHeaders(String data) {
+        // toma los primeros 20 caracteres (ya vienen con "[" al inicio por runReport)
+        String header = data.replace(">", "").substring(0, 20) + "]\n";
+        int firstIndexDetail = data.indexOf("16");
+        String headerInfo;
+        if (firstIndexDetail != -1) {
+            headerInfo = data.substring(data.indexOf("12"), firstIndexDetail);
+        } else {
+            headerInfo = data.substring(data.indexOf("12"), data.indexOf("]", data.indexOf("12")));
+        }
+        return header + headerInfo;
+    }
+
+    // Detalle EXACTO: parte desde el primer "16", splitea por "D0", arma líneas "16..." y corta en allOkCode
+    private static String extractDetails(String data, String allOkCode) {
+        int firstIndexDetail = data.indexOf("16");
         StringBuilder detail = new StringBuilder();
-        if (detailsData.length > 1) {
+        if (firstIndexDetail != -1) {
+            String[] detailsData = data.substring(firstIndexDetail)
+                                    .replace("[", "")
+                                    .replace("]\n", "")
+                                    .split("D0");
             for (int i = 1; i < detailsData.length; i++) {
-                if (detailsData[i] != null && detailsData[i].length() >= 83) {
-                    if ((detailsData[i].substring(0, 2)).equals("D9")) {
-                        detail.append(detailsData[i].substring(0, 83));
-                        String a = detailsData[i].substring(83);
-                        if (a.contains(allOkCode)) {
-                            detail.append(a, 0, a.indexOf(allOkCode) + allOkCode.length());
-                        }
-                    } else if ((detailsData[i].substring(0, 2)).equals("D1")) {
-                        detail.append(detailsData[i].substring(0, 83));
-                        String a = detailsData[i].substring(83);
-                        if (a.contains(allOkCode)) {
-                            detail.append(a, 0, a.indexOf(allOkCode) + allOkCode.length());
-                        }
+                detail.append("16");
+                if (detailsData[i].substring(57).length() < 26) {
+                    String codErrors = String.format("%26s", detailsData[i].substring(57).trim().substring(0, 15));
+                    detail.append(detailsData[i].substring(0, 57)).append(codErrors);
+                    continue;
+                }
+                if (i == detailsData.length - 1) {
+                    if (detailsData[i].substring(57).length() < 26) {
+                        String codErrors = String.format("%26s", detailsData[i].substring(57).trim().substring(0, 15));
+                        detail.append(detailsData[i].substring(0, 57)).append(codErrors).append(allOkCode);
                     } else {
                         int codresp = detailsData[i].indexOf(allOkCode);
                         if (codresp != -1) {
-                            detail.append(detailsData[i], 0, codresp + allOkCode.length());
+                            detail.append(detailsData[i].substring(0, codresp + allOkCode.length()));
                         }
                     }
                     break;
                 }
-                detail.append(detailsData[i].substring(0, Math.min(83, detailsData[i].length())));
+                detail.append(detailsData[i].substring(0, 83));
             }
             return detail.toString().replace("D0", "\nD0");
         }
         return detail.toString();
     }
+
 
     // ============================== INTERACTIVO ==============================
     static class Interactive {
@@ -741,4 +767,3 @@ public class McBatchSender {
         }
     }
 }
-
