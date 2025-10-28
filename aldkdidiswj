@@ -527,6 +527,21 @@ public class McBatchSender {
         return v == null ? "" : v.trim();
     }
 
+    static String firstAcceptedOrDefault(General g) {
+        if (g.acceptedCode != null && g.acceptedCode.size() > 0 && g.acceptedCode.get(0) != null && g.acceptedCode.get(0).length() > 0) {
+            return g.acceptedCode.get(0);
+        }
+        return "9980100";
+    }
+
+    static byte[] readAllBytesOrEmpty(Path p) {
+        try {
+            return Files.readAllBytes(p);
+        } catch (Exception e) {
+            return new byte[0];
+        }
+    }
+
     static class Interactive {
         static void run() throws Exception {
             BufferedReader br = new BufferedReader(new InputStreamReader(System.in));
