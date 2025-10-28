@@ -55,10 +55,12 @@ public class McBatchSender {
             General general = General.from(ini);
             Business biz = Business.from(ini, section);
 
+            final boolean isMIP = isMIPSection(section); // <-- selecciona reglas por sección
+
             if (option == 1) {
                 Sender.runSend(general, biz, fileParam, yyyymmdd);
             } else if (option == 2) {
-                Sender.runReport(general, biz, fileParam, yyyymmdd);
+                Sender.runReport(general, biz, fileParam, yyyymmdd, isMIP); // <-- pasa el flag
             } else if (option == 3) {
                 Sender.runDownload(general, biz, fileParam, yyyymmdd);
             } else {
@@ -252,9 +254,8 @@ public class McBatchSender {
             }
         }
 
-        // ------------------- Opcion 2: Reporte (procesa) -------------------
         // ------------------- Opcion 2: Descarga y genera reporte -------------------
-        static void runReport(General g, Business b, String fileParam, String yyyymmdd) {
+        static void runReport(General g, Business b, String fileParam, String yyyymmdd, boolean isMIP) {
             logger.info("=== OPCION 2: Descarga y genera reporte ===");
             logger.info("Host: " + b.host + " Puerto: " + b.port);
 
@@ -297,10 +298,13 @@ public class McBatchSender {
                     return;
                 }
 
-                // Éxito: ordenar usando las mismas reglas del original (headers + details)
+                // Éxito: ordenar usando reglas GCO o MIP
                 String dataToWrite;
+                String allOk = firstAcceptedOrDefault(g);
                 try {
-                    dataToWrite = orderDetails(rawAcc.toString(), firstAcceptedOrDefault(g));
+                    dataToWrite = isMIP
+                            ? orderDetailsMIP(rawAcc.toString(), allOk)  // reglas MIP (H/D0)
+                            : orderDetails(rawAcc.toString(), allOk);    // reglas GCO (12/16)
                 } catch (Exception ex) {
                     logger.severe("Error al ordenar; se guarda crudo");
                     dataToWrite = rawAcc.toString();
@@ -545,6 +549,11 @@ public class McBatchSender {
 
     // ============================== HELPERS GLOBALES ==============================
 
+    // detecta si la sección indica MIP (exactamente "MIP")
+    private static boolean isMIPSection(String sectionName) {
+        return sectionName != null && sectionName.trim().equalsIgnoreCase("MIP");
+    }
+
     // acceptedCode check
     private static boolean hasAccepted(String text, List<String> acceptedCodes) {
         if (text == null || acceptedCodes == null || acceptedCodes.isEmpty()) return false;
@@ -567,7 +576,6 @@ public class McBatchSender {
                 ? g.defaultFailCode
                 : "9980101"; // fallback defensivo
     }
-
 
     // preview 80B
     private static String preview80(String s) {
@@ -656,8 +664,9 @@ public class McBatchSender {
         return out;
     }
 
-    // Reordenamiento de detalles (mantener firma y logica original aproximada)
-    // Compone el reporte como antes: encabezado + detalle ordenado
+    // ====================== REGLAS GCO (las que ya tenías) ======================
+
+    // Compone el reporte como antes: encabezado + detalle ordenado (GCO)
     private static String orderDetails(String dataMipDato, String allOkCode) {
         String headers = extractHeaders(dataMipDato);
         String details = extractDetails(dataMipDato, allOkCode);
@@ -678,7 +687,7 @@ public class McBatchSender {
         return header + headerInfo;
     }
 
-    // Detalle EXACTO: parte desde el primer "16", splitea por "D0", arma líneas "16..." y corta en allOkCode
+    // Detalle EXACTO (GCO): parte desde el primer "16", splitea por "D0", arma líneas "16..." y corta en allOkCode
     private static String extractDetails(String data, String allOkCode) {
         int firstIndexDetail = data.indexOf("16");
         StringBuilder detail = new StringBuilder();
@@ -713,6 +722,64 @@ public class McBatchSender {
         return detail.toString();
     }
 
+    // ====================== REGLAS MIP (según tus screenshots) ======================
+
+    private static String orderDetailsMIP(String data, String allOkCode) {
+        String headers = extractHeadersMIP(data);
+        String details = extractDetailsMIP(data, allOkCode);
+        return headers + details;
+    }
+
+    // Header MIP: primera línea "[...]\n" + bloque desde 'H' hasta antes del primer 'D' (o hasta ']')
+    private static String extractHeadersMIP(String data) {
+        String header = data.replace(">", "").substring(0, 20) + "]\n";
+        int firstIndexDetail = data.indexOf("D");      // en MIP los detalles empiezan en 'D...'
+        int idxH = data.indexOf("H");
+        if (idxH == -1) idxH = 0;                      // defensivo
+        String headerInfo;
+        if (firstIndexDetail != -1 && firstIndexDetail > idxH) {
+            headerInfo = data.substring(idxH, firstIndexDetail);
+        } else {
+            headerInfo = data.substring(idxH, data.indexOf("]", idxH));
+        }
+        return header + headerInfo;
+    }
+
+    // Detalles MIP: bloques "D0...", padding de 26 si tail<26, y corte en allOkCode al final
+    private static String extractDetailsMIP(String data, String allOkCode) {
+        int firstIndexDetail = data.indexOf("D"); // MIP
+        StringBuilder detail = new StringBuilder();
+        if (firstIndexDetail != -1) {
+            String[] detailsData = data.substring(firstIndexDetail)
+                                       .replace("[", "")
+                                       .replace("]\n", "")
+                                       .split("D0");
+            for (int i = 1; i < detailsData.length; i++) {
+                detail.append("D0");
+                String cur = detailsData[i];
+                String tail = (cur.length() > 57) ? cur.substring(57) : "";
+
+                if (tail.length() < 26) {
+                    String codErrors = String.format("%26s", tail.trim().substring(0, Math.min(15, tail.trim().length())));
+                    detail.append(cur.substring(0, Math.min(57, cur.length()))).append(codErrors);
+                    if (i == detailsData.length - 1) detail.append(allOkCode);
+                    continue;
+                }
+
+                if (i == detailsData.length - 1) {
+                    int codresp = cur.indexOf(allOkCode);
+                    if (codresp != -1) {
+                        detail.append(cur.substring(0, Math.min(codresp + allOkCode.length(), cur.length())));
+                        break;
+                    }
+                }
+
+                detail.append(cur.substring(0, Math.min(83, cur.length())));
+            }
+            return detail.toString().replace("D0", "\nD0");
+        }
+        return detail.toString();
+    }
 
     // ============================== INTERACTIVO ==============================
     static class Interactive {
@@ -760,8 +827,10 @@ public class McBatchSender {
                     : applyFormat(biz.formatRecieveMC, fileParam, date);
             System.out.println("Nombre exacto: " + preview);
 
+            boolean isMIP = isMIPSection(sec); // <-- reglas por sección en modo interactivo
+
             if (op == 1) Sender.runSend(general, biz, fileParam, date);
-            else if (op == 2) Sender.runReport(general, biz, fileParam, date);
+            else if (op == 2) Sender.runReport(general, biz, fileParam, date, isMIP);
             else if (op == 3) Sender.runDownload(general, biz, fileParam, date);
             else System.err.println("Opcion invalida");
         }
