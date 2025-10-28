@@ -550,6 +550,21 @@ public class McBatchSender {
         return false;
     }
 
+    // -- Devuélveme el primer acceptedCode no vacío; si no hay, usa el defaultFailCode
+    private static String firstAcceptedOrDefault(McBatchSender.General g) {
+        if (g != null && g.acceptedCode != null) {
+            for (String c : g.acceptedCode) {
+                if (c != null && !c.trim().isEmpty()) {
+                    return c.trim();
+                }
+            }
+        }
+        return (g != null && g.defaultFailCode != null && !g.defaultFailCode.isEmpty())
+                ? g.defaultFailCode
+                : "9980101"; // fallback defensivo
+    }
+
+
     // preview 80B
     private static String preview80(String s) {
         if (s == null) return "";
@@ -726,3 +741,4 @@ public class McBatchSender {
         }
     }
 }
+
