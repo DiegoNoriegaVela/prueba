@@ -436,11 +436,14 @@ public class McBatchSender {
 
                 String finalData = allData.toString();
 
-                // Escribir exactamente en el archivo indicado
-                try (PrintStream ps = new PrintStream(new FileOutputStream(fullName), true, "UTF-8")) {
+                // ✅ Guardar en archivo: nombre_consultado.out
+                String outputFileName = fullName + ".out";
+                try (PrintStream ps = new PrintStream(new FileOutputStream(outputFileName), true, "UTF-8")) {
                     ps.print(finalData);
                 }
+                logger.info("Archivo guardado: " + outputFileName);
 
+                // ✅ Mostrar respuesta en consola
                 logger.info("Resp: [" + finalData.trim() + "]");
             } catch (Exception ex) {
                 logger.severe("Error envio manual: " + ex.getMessage());
