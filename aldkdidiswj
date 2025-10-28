@@ -128,7 +128,8 @@ public class McBatchSender {
             Map<String,String> s = ini.section(section);
             if (s == null) throw new IllegalArgumentException("No existe la seccion ["+section+"]");
 
-            String hostSec = s.getOrDefault("hostSection", "HOST_MC");
+            // ✅ Usar 'hostRef' como en el INI
+            String hostSec = s.getOrDefault("hostRef", s.getOrDefault("hostSection", "HOST_MC"));
             Map<String,String> hs = ini.section(hostSec);
             if (hs == null) throw new IllegalArgumentException("No existe la seccion ["+hostSec+"]");
             String host = req(hs, "host");
@@ -254,7 +255,7 @@ public class McBatchSender {
             logger.info("Nombre base: " + base);
 
             boolean found = false;
-            String foundName = null;
+            String foundQuery = null;
             StringBuilder allChunks = new StringBuilder();
 
             try (Socket sock = new Socket()) {
@@ -275,7 +276,7 @@ public class McBatchSender {
                     
                     while (moreData) {
                         String chunk = readSingleChunk(sock);
-                        allChunks.append("[").append(chunk).append("]\n");
+                        allChunks.append(chunk);
                         
                         // Verifica si llegó el código de éxito
                         if (chunk.contains("998010")) {
@@ -287,12 +288,11 @@ public class McBatchSender {
                     String accumulated = allChunks.toString();
                     if (hasAccepted(accumulated, g.acceptedCode)) {
                         found = true;
-                        foundName = query;
+                        foundQuery = query;
                         logger.info("Archivo encontrado [OK]");
-                        break; // ✅ Encontró el archivo, sale del loop
+                        break;
                     } else {
                         logger.info("Buscando...");
-                        // NO encontró, sigue con el siguiente (02, 03...)
                     }
                 }
 
@@ -305,24 +305,25 @@ public class McBatchSender {
                     return;
                 }
 
-                // ✅ Construir reporte con el nombre encontrado y TODO el contenido acumulado
-                String rawForReport = "[" + foundName + "]\n" + allChunks.toString()
-                                        .replace("[", "")
-                                        .replace("]\n", "");
+                String rawContent = allChunks.toString();
 
-                String dataToWrite;
-                String allOk = firstAcceptedOrDefault(g);
-                try {
-                    dataToWrite = isMIP
-                            ? orderDetailsMIP(rawForReport, allOk)
-                            : orderDetails(rawForReport, allOk);
-                } catch (Exception ex) {
-                    logger.severe("Error al ordenar; se guarda crudo");
-                    dataToWrite = rawForReport;
+                if (isMIP) {
+                    // ✅ MIP: Genera reporte formateado
+                    String dataToWrite;
+                    String allOk = firstAcceptedOrDefault(g);
+                    try {
+                        dataToWrite = orderDetailsMIP(rawContent, allOk);
+                    } catch (Exception ex) {
+                        logger.severe("Error al ordenar; se guarda crudo");
+                        dataToWrite = rawContent;
+                    }
+                    writeReportFile(yyyymmdd, dataToWrite, fileParam);
+                    logger.info("Reporte MIP generado OK");
+                } else {
+                    // ✅ GCO: Guarda en crudo con el nombre del archivo consultado
+                    writeRawWithQueryName(foundQuery, rawContent);
+                    logger.info("Archivo GCO descargado OK (crudo): " + foundQuery);
                 }
-
-                writeReportFile(yyyymmdd, dataToWrite, fileParam);
-                logger.info("Reporte OK");
 
             } catch (Exception ex) {
                 logger.severe("Error reporte: " + ex.getMessage());
@@ -562,6 +563,14 @@ public class McBatchSender {
             logger.info("Archivo escrito: " + name);
         }
 
+        private static void writeRawWithQueryName(String queryName, String data) throws IOException {
+            String name = (queryName == null || queryName.isEmpty()) ? "ARCHIVO_CRUDO" : queryName;
+            try (PrintStream ps = new PrintStream(new FileOutputStream(name), true, "UTF-8")) {
+                ps.print(data == null ? "" : data);
+            }
+            logger.info("Archivo escrito: " + name);
+        }
+
         private static void createHistoryRecord(String respCode, String fileName, String yyyymmdd, Path historyPath) {
             try {
                 String record = "[" + respCode + "-" + fileName + "-" + yyyymmdd + ": " +
@@ -701,61 +710,6 @@ public class McBatchSender {
         return out;
     }
 
-    // ====================== REGLAS GCO ======================
-
-    private static String orderDetails(String dataMipDato, String allOkCode) {
-        String headers = extractHeaders(dataMipDato);
-        String details = extractDetails(dataMipDato, allOkCode);
-        return headers + details;
-    }
-
-    private static String extractHeaders(String data) {
-        String name = extractBracketedName(data);
-        String header = "[" + name + "]\n";
-        int firstIndexDetail = data.indexOf("16");
-        String headerInfo;
-        if (firstIndexDetail != -1) {
-            headerInfo = data.substring(data.indexOf("12"), firstIndexDetail);
-        } else {
-            headerInfo = data.substring(data.indexOf("12"), data.indexOf("]", data.indexOf("12")));
-        }
-        return header + headerInfo;
-    }
-
-    private static String extractDetails(String data, String allOkCode) {
-        int firstIndexDetail = data.indexOf("16");
-        StringBuilder detail = new StringBuilder();
-        if (firstIndexDetail != -1) {
-            String[] detailsData = data.substring(firstIndexDetail)
-                                    .replace("[", "")
-                                    .replace("]\n", "")
-                                    .split("D0");
-            for (int i = 1; i < detailsData.length; i++) {
-                detail.append("16");
-                if (detailsData[i].substring(57).length() < 26) {
-                    String codErrors = String.format("%26s", detailsData[i].substring(57).trim().substring(0, 15));
-                    detail.append(detailsData[i].substring(0, 57)).append(codErrors);
-                    continue;
-                }
-                if (i == detailsData.length - 1) {
-                    if (detailsData[i].substring(57).length() < 26) {
-                        String codErrors = String.format("%26s", detailsData[i].substring(57).trim().substring(0, 15));
-                        detail.append(detailsData[i].substring(0, 57)).append(codErrors).append(allOkCode);
-                    } else {
-                        int codresp = detailsData[i].indexOf(allOkCode);
-                        if (codresp != -1) {
-                            detail.append(detailsData[i].substring(0, codresp + allOkCode.length()));
-                        }
-                    }
-                    break;
-                }
-                detail.append(detailsData[i].substring(0, 83));
-            }
-            return detail.toString().replace("D0", "\nD0");
-        }
-        return detail.toString();
-    }
-
     // ====================== REGLAS MIP ======================
 
     private static String orderDetailsMIP(String data, String allOkCode) {
@@ -845,12 +799,29 @@ public class McBatchSender {
     }
 
     private static String extractBracketedName(String data) {
-        if (data == null) return "";
-        int lb = data.indexOf('[');
-        if (lb == -1) return "";
-        int rb = data.indexOf(']', lb + 1);
-        if (rb == -1) return "";
-        return data.substring(lb + 1, rb).trim();
+        if (data == null || data.isEmpty()) return "";
+        
+        // Buscar el primer "TH" o "12" o "16" o "H" para saber dónde termina el nombre
+        int idxTH = data.indexOf("TH");
+        int idx12 = data.indexOf("12");
+        int idx16 = data.indexOf("16");
+        int idxH = data.indexOf("H");
+        
+        // Tomar el índice más cercano al inicio
+        int endIdx = -1;
+        if (idxTH != -1) endIdx = idxTH;
+        if (idx12 != -1 && (endIdx == -1 || idx12 < endIdx)) endIdx = idx12;
+        if (idx16 != -1 && (endIdx == -1 || idx16 < endIdx)) endIdx = idx16;
+        if (idxH != -1 && (endIdx == -1 || idxH < endIdx)) endIdx = idxH;
+        
+        if (endIdx == -1) {
+            // No encontró ningún marcador, devolver limpio hasta el final
+            return data.replace("[", "").replace("]", "").replace("\n", "").trim();
+        }
+        
+        // Extraer desde el inicio hasta el marcador encontrado
+        String name = data.substring(0, endIdx);
+        return name.replace("[", "").replace("]", "").replace("\n", "").trim();
     }
 
     // ============================== INTERACTIVO ==============================
