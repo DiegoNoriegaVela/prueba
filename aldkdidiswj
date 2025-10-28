@@ -4,223 +4,296 @@ import java.nio.file.*;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.logging.*;
+import java.util.logging.Logger;
 
 public class McBatchSender {
-    static final Logger logger = Logger.getLogger("McBatchSender");
-    static {
+    private static final Logger logger = Logger.getLogger(McBatchSender.class.getName());
+
+    public static void main(String[] args) {
         try {
-            logger.setUseParentHandlers(false);
-            ConsoleHandler ch = new ConsoleHandler();
-            ch.setLevel(Level.INFO);
-            logger.addHandler(ch);
-            logger.setLevel(Level.INFO);
-        } catch (Exception ignored) {}
+            if (args == null || args.length == 0) {
+                Interactive.run();
+                return;
+            }
+            int option = Integer.parseInt(args[0].trim());
+            if (option == 4) {
+                if (args.length < 4) {
+                    System.err.println("Uso: java McBatchSender 4 <IP> <PUERTO> <FULL_NAME>");
+                    return;
+                }
+                IniFile ini = IniFile.load(Paths.get("mcsender.ini"));
+                General general = General.from(ini);
+                String ip = args[1].trim();
+                int port = Integer.parseInt(args[2].trim());
+                String fullName = args[3];
+                Sender.runManualSend(general, ip, port, fullName);
+                return;
+            }
+            if (args.length < 4) {
+                System.err.println("Uso: java McBatchSender <OPC> <SECCION> <FILE> <YYYYMMDD>");
+                return;
+            }
+            String section = args[1].trim();
+            String fileParam = args[2].trim();
+            String yyyymmdd = args[3].trim();
+            if (!validateDate(yyyymmdd)) {
+                System.err.println("Fecha invalida, formato esperado yyyymmdd");
+                return;
+            }
+            IniFile ini = IniFile.load(Paths.get("mcsender.ini"));
+            General general = General.from(ini);
+            Business biz = Business.from(ini, section);
+            switch (option) {
+                case 1:
+                    Sender.runSend(general, biz, fileParam, yyyymmdd);
+                    break;
+                case 2:
+                    Sender.runReport(general, biz, fileParam, yyyymmdd);
+                    break;
+                case 3:
+                    Sender.runDownload(general, biz, fileParam, yyyymmdd);
+                    break;
+                default:
+                    System.out.println("Opcion invalida");
+            }
+            System.out.println("PROCESO FINALIZADO");
+        } catch (Exception e) {
+            System.err.println("Fallo: " + e.getMessage());
+        }
     }
 
     static class General {
-        int connectTimeoutMs;
-        int soTimeoutMs;
-        int chunkSize;
-        List<String> acceptedCode = new ArrayList<>();
-        String alreadySentSubstring = "";
-        String defaultFailCode = "9980900";
-        static General fromIni(IniFile ini) {
-            General g = new General();
-            g.connectTimeoutMs = ini.getInt("GENERAL","connectTimeoutMs",60000);
-            g.soTimeoutMs = ini.getInt("GENERAL","soTimeoutMs",60000);
-            g.chunkSize = ini.getInt("GENERAL","chunkSize",980);
-            String acc = ini.get("GENERAL","acceptedCode","");
-            if (acc == null) acc = "";
-            if (acc.contains(",")) {
-                String[] arr = acc.split(",");
-                for (String s : arr) {
-                    String t = s.trim();
-                    if (!t.isEmpty()) g.acceptedCode.add(t);
+        final int connectTimeoutMs;
+        final int soTimeoutMs;
+        final int chunkSize;
+        final List<String> acceptedCode;
+        final String alreadySentSubstring;
+        final String defaultFailCode;
+
+        General(int cto, int sto, int chunk, List<String> acc, String already, String fail) {
+            this.connectTimeoutMs = cto;
+            this.soTimeoutMs = sto;
+            this.chunkSize = chunk;
+            this.acceptedCode = acc;
+            this.alreadySentSubstring = already;
+            this.defaultFailCode = fail;
+        }
+
+        static General from(IniFile ini) {
+            int cto = ini.getInt("GENERAL", "connectTimeoutMs", 60000);
+            int sto = ini.getInt("GENERAL", "soTimeoutMs", 60000);
+            int chunk = ini.getInt("GENERAL", "chunkSize", 980);
+            String acc = ini.get("GENERAL", "acceptedCode", "");
+            List<String> codes = new ArrayList<String>();
+            if (acc != null && acc.trim().length() > 0) {
+                if (acc.indexOf(',') >= 0) {
+                    String[] parts = acc.split(",");
+                    for (int i = 0; i < parts.length; i++) {
+                        String t = parts[i].trim();
+                        if (t.length() > 0) codes.add(t);
+                    }
+                } else {
+                    codes.add(acc.trim());
                 }
-            } else {
-                String t = acc.trim();
-                if (!t.isEmpty()) g.acceptedCode.add(t);
             }
-            g.alreadySentSubstring = ini.get("GENERAL","alreadySentSubstring","");
-            g.defaultFailCode = ini.get("GENERAL","defaultFailCode","9980101");
-            if (g.acceptedCode.isEmpty()) g.acceptedCode = Arrays.asList("9980100");
-            return g;
+            if (codes.isEmpty()) codes = Arrays.asList(new String[]{"9980100"});
+            String already = ini.get("GENERAL", "alreadySentSubstring", "");
+            String fail = ini.get("GENERAL", "defaultFailCode", "9980101");
+            return new General(cto, sto, chunk, codes, already, fail);
         }
     }
 
     static class Business {
-        String section;
-        String host;
-        int port;
-        String originalFile;
-        String historyFile;
-        String formatSendMC;
-        String formatRecieveMC;
-        static Business fromIni(IniFile ini, String section) {
-            Map<String,String> m = ini.sections.get(section);
-            if (m == null) throw new IllegalArgumentException("Seccion no encontrada: " + section);
-            Business b = new Business();
-            b.section = section;
-            String hostRef = m.get("hostRef") == null ? "" : m.get("hostRef").trim();
-            if (hostRef.isEmpty()) {
-                b.host = ini.get(section,"host","");
-                b.port = Integer.parseInt(ini.get(section,"port","0"));
+        final String section;
+        final String host;
+        final int port;
+        final String originalFile;
+        final String historyFile;
+        final String formatSendMC;
+        final String formatRecieveMC;
+
+        Business(String section, String host, int port, String originalFile, String historyFile, String formatSendMC, String formatRecieveMC) {
+            this.section = section;
+            this.host = host;
+            this.port = port;
+            this.originalFile = originalFile;
+            this.historyFile = historyFile;
+            this.formatSendMC = formatSendMC;
+            this.formatRecieveMC = formatRecieveMC;
+        }
+
+        static Business from(IniFile ini, String section) {
+            Map<String, String> sec = ini.sections.get(section);
+            if (sec == null) throw new IllegalArgumentException("Seccion no encontrada: " + section);
+            String hostRef = getOrEmpty(sec, "hostRef");
+            String host;
+            int port;
+            if (hostRef.length() > 0) {
+                Map<String, String> hr = ini.sections.get(hostRef);
+                if (hr == null) throw new IllegalArgumentException("hostRef no encontrado: " + hostRef);
+                host = getOrEmpty(hr, "host");
+                port = parseInt(getOrEmpty(hr, "port"), 1, 65535, "port");
             } else {
-                Map<String,String> hm = ini.sections.get(hostRef);
-                if (hm == null) throw new IllegalArgumentException("hostRef no encontrado: " + hostRef);
-                b.host = hm.get("host") == null ? "" : hm.get("host").trim();
-                String pv = hm.get("port") == null ? "0" : hm.get("port").trim();
-                b.port = Integer.parseInt(pv);
+                host = getOrEmpty(sec, "host");
+                port = parseInt(getOrEmpty(sec, "port"), 1, 65535, "port");
             }
-            b.originalFile = m.get("originalFile") == null ? "" : m.get("originalFile").trim();
-            b.historyFile = m.get("historyFile") == null ? "" : m.get("historyFile").trim();
-            b.formatSendMC = m.get("formatSendMC") == null ? "" : m.get("formatSendMC").trim();
-            b.formatRecieveMC = m.get("formatRecieveMC") == null ? "" : m.get("formatRecieveMC").trim();
-            if (b.host.isEmpty() || b.port <= 0) throw new IllegalArgumentException("Host/Port invalidos en seccion: " + section);
-            return b;
+            String orig = getOrEmpty(sec, "originalFile");
+            String hist = getOrEmpty(sec, "historyFile");
+            String fmtS = getOrEmpty(sec, "formatSendMC");
+            String fmtR = getOrEmpty(sec, "formatRecieveMC");
+            return new Business(section, host, port, orig, hist, fmtS, fmtR);
         }
     }
 
-    static void runSend(General g, Business b, String fileParam, String yyyymmdd) {
-        logger.info("=== OPCION 1: Envio ===");
-        logger.info("Host: " + b.host + " Puerto: " + b.port);
-        String nameToSend = applyFormat(b.formatSendMC, fileParam, yyyymmdd);
-        logger.info("Nombre a enviar: " + nameToSend);
-        String finalStatus = g.defaultFailCode;
-        try (Socket sock = new Socket()) {
-            sock.connect(new InetSocketAddress(b.host, b.port), g.connectTimeoutMs);
-            sock.setSoTimeout(g.soTimeoutMs);
-            writeFrameName(sock, nameToSend);
-            String resp = readResponseAscii(sock).trim();
-            logger.info("Resp nombre: [" + preview80(resp) + "]");
-            Path p = Paths.get(fileParam);
-            byte[] data = Files.readAllBytes(p);
-            List<byte[]> parts = splitWithPrefixR(data, g.chunkSize - 1);
-            if (!g.alreadySentSubstring.isEmpty() && resp.contains(g.alreadySentSubstring)) {
-                finalStatus = firstAcceptedOrDefault(g);
-            } else if (hasAccepted(resp, g.acceptedCode)) {
-                for (byte[] chunk : parts) writeFrameData(sock, chunk);
-                writeTrailer(sock, parts.size());
-                String resp2 = readResponseAscii(sock);
-                logger.info("Confirmacion: [" + preview80(resp2) + "]");
-                if (hasAccepted(resp2, g.acceptedCode)) finalStatus = firstAcceptedOrDefault(g);
-            } else {
-                logger.warning("Nombre rechazado");
-                writeErrorTextDump(fileParam, yyyymmdd, resp);
-            }
-        } catch (Exception ex) {
-            logger.severe("Error envio: " + ex.getMessage());
-        } finally {
-            createHistoryRecord(finalStatus, fileParam, yyyymmdd, historyDir(b));
-            logger.info("=== FIN OPCION 1 ===");
-        }
-    }
+    static class Sender {
 
-    static void runReport(General g, Business b, String fileParam, String yyyymmdd) {
-        logger.info("=== OPCION 2: Descarga y genera reporte ===");
-        logger.info("Host: " + b.host + " Puerto: " + b.port);
-        String base = applyFormat(b.formatRecieveMC, fileParam, yyyymmdd);
-        logger.info("Nombre base: " + base);
-        boolean found = false;
-        StringBuilder rawAcc = new StringBuilder();
-        try (Socket sock = new Socket()) {
-            sock.connect(new InetSocketAddress(b.host, b.port), g.connectTimeoutMs);
-            sock.setSoTimeout(g.soTimeoutMs);
-            for (int i = 1; i <= 99; i++) {
-                String sec = String.format("%02d", i);
-                String query = base + sec;
-                logger.info("Consultando: " + query);
-                writeFrameName(sock, query);
-                String chunk = readLegacyOneShotAscii(sock);
-                rawAcc.setLength(0);
-                rawAcc.append("[").append(chunk).append("]\n");
-                if (hasAccepted(rawAcc.toString(), g.acceptedCode)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                logger.severe("No encontrado");
-                String rr = rawAcc.toString();
-                logger.info("[Preview 80B] " + preview80(rr));
-                writeErrorTextDump(fileParam, yyyymmdd, rr);
+        static void runSend(General g, Business b, String fileParam, String yyyymmdd) {
+            logger.info("=== OPCION 1: Envio ===");
+            logger.info("Host: " + b.host + " Puerto: " + b.port);
+            File cwd = new File(System.getProperty("user.dir"));
+            if (!cwd.canRead() || !cwd.canExecute()) throw new IllegalStateException("CWD sin permisos");
+            Path dataFile = b.originalFile != null && b.originalFile.length() > 0 ? Paths.get(b.originalFile) : Paths.get(fileParam);
+            Path history = historyDir(b);
+            byte[] payload = readAllBytesOrEmpty(dataFile);
+            if (payload == null || payload.length == 0) {
+                logger.severe("Archivo de entrada vacio");
                 return;
             }
-            String dataToWrite = rawAcc.toString();
-            writeReportTextFile(yyyymmdd, dataToWrite, fileParam);
-            logger.info("Reporte OK");
-        } catch (Exception ex) {
-            logger.severe("Error reporte: " + ex.getMessage());
-        } finally {
-            logger.info("=== FIN OPCION 2 ===");
+            String nameToSend = applyFormat(b.formatSendMC, baseName(fileParam), yyyymmdd);
+            logger.info("Nombre a enviar: " + nameToSend);
+            String finalStatus = g.defaultFailCode;
+            try (Socket sock = new Socket()) {
+                sock.connect(new InetSocketAddress(b.host, b.port), g.connectTimeoutMs);
+                sock.setSoTimeout(g.soTimeoutMs);
+                writeFrameName(sock, nameToSend);
+                String resp = readResponse(sock).trim();
+                logger.info("Resp nombre: [" + preview80(resp) + "]");
+                if (g.alreadySentSubstring != null && g.alreadySentSubstring.length() > 0 && resp.contains(g.alreadySentSubstring)) {
+                    finalStatus = firstAcceptedOrDefault(g);
+                } else if (hasAccepted(resp, g.acceptedCode)) {
+                    List<byte[]> parts = splitWithPrefixR(payload, Math.max(1, g.chunkSize - 1));
+                    for (int i = 0; i < parts.size(); i++) writeFrameData(sock, parts.get(i));
+                    writeTrailer(sock, parts.size());
+                    String resp2 = readResponse(sock);
+                    logger.info("Confirmacion: [" + preview80(resp2) + "]");
+                    if (hasAccepted(resp2, g.acceptedCode)) finalStatus = firstAcceptedOrDefault(g);
+                } else {
+                    logger.warning("Nombre rechazado");
+                    writeErrorTextDump(fileParam, yyyymmdd, resp);
+                }
+            } catch (Exception ex) {
+                logger.severe("Error envio: " + ex.getMessage());
+            } finally {
+                createHistoryRecord(finalStatus, fileParam, yyyymmdd, history);
+                logger.info("=== FIN OPCION 1 ===");
+            }
         }
-    }
 
-    static void runDownload(General g, Business b, String fileParam, String yyyymmdd) {
-        logger.info("=== OPCION 3: Descarga ===");
-        logger.info("Host: " + b.host + " Puerto: " + b.port);
-        String base = applyFormat(b.formatRecieveMC, fileParam, yyyymmdd);
-        logger.info("Nombre base: " + base);
-        try (Socket sock = new Socket()) {
-            sock.connect(new InetSocketAddress(b.host, b.port), g.connectTimeoutMs);
-            sock.setSoTimeout(g.soTimeoutMs);
+        static void runReport(General g, Business b, String fileParam, String yyyymmdd) {
+            logger.info("=== OPCION 2: Descarga y genera reporte ===");
+            logger.info("Host: " + b.host + " Puerto: " + b.port);
+            String base = applyFormat(b.formatRecieveMC, baseName(fileParam), yyyymmdd);
+            logger.info("Nombre base: " + base);
             boolean found = false;
-            byte[] lastRaw = null;
-            String lastAscii = null;
-            String chosenQuery = null;
-            for (int i = 1; i <= 99; i++) {
-                String sec = String.format("%02d", i);
-                String query = base + sec;
-                logger.info("Consultando: " + query);
-                writeFrameName(sock, query);
-                byte[] raw = readAllFrames(sock);
-                String ascii = fromEbcdic(raw);
-                lastRaw = raw;
-                lastAscii = ascii;
-                if (hasAccepted(ascii, g.acceptedCode)) {
-                    chosenQuery = query;
-                    writeRawBytesFile(yyyymmdd, raw, fileParam);
-                    logger.info("Descarga OK con " + chosenQuery);
-                    logger.info("[Preview 80B] " + preview80(ascii));
-                    found = true;
-                    break;
+            StringBuilder rawAcc = new StringBuilder();
+            try (Socket sock = new Socket()) {
+                sock.connect(new InetSocketAddress(b.host, b.port), g.connectTimeoutMs);
+                sock.setSoTimeout(g.soTimeoutMs);
+                for (int i = 1; i <= 99; i++) {
+                    String sec = String.format("%02d", i);
+                    String query = base + sec;
+                    logger.info("Consultando: " + query);
+                    writeFrameName(sock, query);
+                    String chunk = readLegacyOneShot(sock);
+                    rawAcc.setLength(0);
+                    rawAcc.append("[").append(chunk).append("]\n");
+                    if (hasAccepted(rawAcc.toString(), g.acceptedCode)) {
+                        found = true;
+                        break;
+                    }
                 }
-            }
-            if (!found) {
-                logger.severe("Ninguna variante aceptada");
-                if (lastAscii != null) {
-                    logger.info("[Preview 80B] " + preview80(lastAscii));
-                    writeErrorTextDump(fileParam, yyyymmdd, lastAscii);
+                if (!found) {
+                    logger.severe("No encontrado");
+                    String rr = rawAcc.toString();
+                    logger.info("[Preview 80B] " + preview80(rr));
+                    writeErrorTextDump(fileParam, yyyymmdd, rr);
+                    return;
                 }
+                String dataToWrite = rawAcc.toString();
+                writeReportFile(yyyymmdd, dataToWrite, fileParam);
+                logger.info("Reporte OK");
+            } catch (Exception ex) {
+                logger.severe("Error reporte: " + ex.getMessage());
+            } finally {
+                logger.info("=== FIN OPCION 2 ===");
             }
-        } catch (Exception ex) {
-            logger.severe("Error descarga: " + ex.getMessage());
-        } finally {
-            logger.info("=== FIN OPCION 3 ===");
         }
-    }
 
-    static void runManualSend(General g, String ip, int port, String fullName) {
-        logger.info("=== OPCION 4: Envio manual ===");
-        logger.info("Host: " + ip + " Puerto: " + port);
-        logger.info("Nombre a enviar: " + fullName);
-        try (Socket sock = new Socket()) {
-            sock.connect(new InetSocketAddress(ip, port), g.connectTimeoutMs);
-            sock.setSoTimeout(g.soTimeoutMs);
-            writeFrameName(sock, fullName);
-            String raw = readResponseAscii(sock);
-            logger.info("Resp: [" + preview80(raw) + "]");
-        } catch (Exception ex) {
-            logger.severe("Error envio manual: " + ex.getMessage());
-        } finally {
-            logger.info("=== FIN OPCION 4 ===");
+        static void runDownload(General g, Business b, String fileParam, String yyyymmdd) {
+            logger.info("=== OPCION 3: Descarga ===");
+            logger.info("Host: " + b.host + " Puerto: " + b.port);
+            String base = applyFormat(b.formatRecieveMC, baseName(fileParam), yyyymmdd);
+            logger.info("Nombre base: " + base);
+            try (Socket sock = new Socket()) {
+                sock.connect(new InetSocketAddress(b.host, b.port), g.connectTimeoutMs);
+                sock.setSoTimeout(g.soTimeoutMs);
+                boolean found = false;
+                byte[] lastRaw = null;
+                String lastAscii = null;
+                String chosenQuery = null;
+                for (int i = 1; i <= 99; i++) {
+                    String sec = String.format("%02d", i);
+                    String query = base + sec;
+                    logger.info("Consultando: " + query);
+                    writeFrameName(sock, query);
+                    byte[] raw = readAllFrames(sock);
+                    String ascii = fromEbcdic(raw);
+                    lastRaw = raw;
+                    lastAscii = ascii;
+                    if (hasAccepted(ascii, g.acceptedCode)) {
+                        chosenQuery = query;
+                        writeRawBytesFile(yyyymmdd, raw, fileParam);
+                        logger.info("Descarga OK con " + chosenQuery);
+                        logger.info("[Preview 80B] " + preview80(ascii));
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    logger.severe("Ninguna variante aceptada");
+                    if (lastAscii != null) {
+                        logger.info("[Preview 80B] " + preview80(lastAscii));
+                        writeErrorTextDump(fileParam, yyyymmdd, lastAscii);
+                    }
+                }
+            } catch (Exception ex) {
+                logger.severe("Error descarga: " + ex.getMessage());
+            } finally {
+                logger.info("=== FIN OPCION 3 ===");
+            }
+        }
+
+        static void runManualSend(General g, String ip, int port, String fullName) {
+            logger.info("=== OPCION 4: Envio manual ===");
+            logger.info("Host: " + ip + " Puerto: " + port);
+            logger.info("Nombre a enviar: " + fullName);
+            try (Socket sock = new Socket()) {
+                sock.connect(new InetSocketAddress(ip, port), g.connectTimeoutMs);
+                sock.setSoTimeout(g.soTimeoutMs);
+                writeFrameName(sock, fullName);
+                String raw = readResponse(sock);
+                logger.info("Resp: [" + preview80(raw) + "]");
+            } catch (Exception ex) {
+                logger.severe("Error envio manual: " + ex.getMessage());
+            } finally {
+                logger.info("=== FIN OPCION 4 ===");
+            }
         }
     }
 
     static Path historyDir(Business b) {
         String h = b.historyFile == null ? "" : b.historyFile.trim();
-        if (h.isEmpty()) return Paths.get("history");
+        if (h.length() == 0) return Paths.get("history");
         try {
             Path p = Paths.get(h).getParent();
             if (p != null) return p;
@@ -239,30 +312,33 @@ public class McBatchSender {
     }
 
     static String reportFileName(String yyyymmdd, String fileName9) {
-        String date = (yyyymmdd == null || yyyymmdd.isEmpty())
+        String date = (yyyymmdd == null || yyyymmdd.length() == 0)
                 ? DateTimeFormatter.ofPattern("yyyyMMdd").format(LocalDate.now())
                 : yyyymmdd;
-        String base = (fileName9 == null || fileName9.isEmpty()) ? "REPORTE" : fileName9;
+        String base = (fileName9 == null || fileName9.length() == 0) ? "REPORTE" : fileName9;
         return base + "-" + date + ".txt";
     }
 
     static List<byte[]> splitWithPrefixR(byte[] data, int chunkDataSize) {
-        List<byte[]> parts = new ArrayList<>();
+        List<byte[]> parts = new ArrayList<byte[]>();
         int total = data.length;
-        for (int off = 0; off < total; off += chunkDataSize) {
+        int off = 0;
+        while (off < total) {
             int len = Math.min(chunkDataSize, total - off);
             byte[] arr = new byte[len + 1];
             arr[0] = (byte) 'R';
             System.arraycopy(data, off, arr, 1, len);
             parts.add(arr);
+            off += len;
         }
         return parts;
     }
 
     static boolean hasAccepted(String text, List<String> acceptedCodes) {
         if (text == null) return false;
-        for (String code : acceptedCodes) {
-            if (code != null && !code.isEmpty() && text.contains(code)) return true;
+        for (int i = 0; i < acceptedCodes.size(); i++) {
+            String code = acceptedCodes.get(i);
+            if (code != null && code.length() > 0 && text.contains(code)) return true;
         }
         return false;
     }
@@ -275,47 +351,58 @@ public class McBatchSender {
     }
 
     static void writeErrorTextDump(String fileParam, String yyyymmdd, String content) {
-        String base = (fileParam == null || fileParam.isEmpty()) ? "ERROR" : ("ERROR_" + fileParam);
+        String base = (fileParam == null || fileParam.length() == 0) ? "ERROR" : ("ERROR_" + fileParam);
         String name = base + "-" + (yyyymmdd == null ? "" : yyyymmdd) + ".out";
-        try (PrintStream ps = new PrintStream(new FileOutputStream(name), true, "UTF-8")) {
-            ps.print(content == null ? "" : content);
+        try {
+            PrintStream ps = new PrintStream(new FileOutputStream(name), true, "UTF-8");
+            try {
+                ps.print(content == null ? "" : content);
+            } finally {
+                ps.close();
+            }
         } catch (Exception ignore) {}
         logger.info("Archivo de error escrito: " + name);
     }
 
     static String applyFormat(String template, String file, String yyyymmdd) {
         if (template == null) template = "";
-        String date = (yyyymmdd == null || yyyymmdd.isEmpty())
-                ? DateTimeFormatter.ofPattern("yyyyMMdd").format(LocalDate.now())
-                : yyyymmdd;
-        LocalDate ld = LocalDate.parse(date, DateTimeFormatter.ofPattern("yyyyMMdd"));
-        String julian = String.format("%03d", ld.getDayOfYear());
-        String out = template.replace("{julianDate}", julian).replace("{yyyymmdd}", date);
+        if (file == null) file = "";
+        LocalDate d = LocalDate.parse(yyyymmdd, DateTimeFormatter.BASIC_ISO_DATE);
+        String jul = String.format("%03d", d.getDayOfYear());
+        String yy = String.format("%02d", d.getYear() % 100);
+        String mm = String.format("%02d", d.getMonthValue());
+        String dd = String.format("%02d", d.getDayOfMonth());
+        return template
+                .replace("{FILE}", file)
+                .replace("{julianDate}", jul)
+                .replace("{yyyymmdd}", yyyymmdd)
+                .replace("{yy}", yy)
+                .replace("{mm}", mm)
+                .replace("{dd}", dd);
+    }
+
+    static String baseName(String file) {
+        if (file == null) return "";
         String f = file;
-        if (f != null) {
-            if (f.contains(File.separator)) f = new File(f).getName();
-            int dot = f.lastIndexOf('.');
-            if (dot > 0) f = f.substring(0, dot);
-            out = out.replace("{FILE}", f);
-        }
-        return out;
+        if (f.indexOf(File.separator) >= 0) f = new File(f).getName();
+        int dot = f.lastIndexOf('.');
+        if (dot > 0) f = f.substring(0, dot);
+        return f;
     }
 
     static byte[] toEbcdic(byte[] ascii) {
         byte[] out = new byte[ascii.length];
         for (int i = 0; i < ascii.length; i++) {
-            int c = ascii[i] & 0xFF;
-            out[i] = (byte) translateByte("ASCII2EBCDIC", c);
+            out[i] = (byte) translateByte("toEBC", ascii[i] & 0xFF);
         }
         return out;
     }
 
     static String fromEbcdic(byte[] ebcdic) {
         StringBuilder sb = new StringBuilder(ebcdic.length);
-        for (byte b : ebcdic) {
-            int v = b & 0xFF;
-            int ac = translateByte("EBCDIC2ASCII", v);
-            if (ac >= 0 && ac <= 0x7F) sb.append((char) ac);
+        for (int i = 0; i < ebcdic.length; i++) {
+            int asc = translateByte("toASC", ebcdic[i] & 0xFF);
+            sb.append((char) asc);
         }
         return sb.toString();
     }
@@ -329,7 +416,7 @@ public class McBatchSender {
     }
 
     static void writeFrameName(Socket s, String name) throws IOException {
-        byte[] body = toEbcdic(name.getBytes());
+        byte[] body = toEbcdic(name.getBytes("UTF-8"));
         writeRawFrame(s, body);
     }
 
@@ -340,7 +427,7 @@ public class McBatchSender {
 
     static void writeTrailer(Socket s, int partsCount) throws IOException {
         String ok = "9980100";
-        byte[] pre = toEbcdic(ok.getBytes());
+        byte[] pre = toEbcdic(ok.getBytes("UTF-8"));
         int cntInt = partsCount + 1;
         byte[] cnt = new byte[4];
         cnt[0] = (byte) translateByteForDiscrepancy((cntInt >>> 24) & 0xFF);
@@ -364,7 +451,7 @@ public class McBatchSender {
         os.flush();
     }
 
-    static String readResponseAscii(Socket s) throws IOException {
+    static String readResponse(Socket s) throws IOException {
         byte[] raw = readAllFrames(s);
         return fromEbcdic(raw);
     }
@@ -388,7 +475,7 @@ public class McBatchSender {
         return baos.toByteArray();
     }
 
-    static String readLegacyOneShotAscii(Socket s) throws IOException {
+    static String readLegacyOneShot(Socket s) throws IOException {
         InputStream is = s.getInputStream();
         byte[] buf = new byte[1024];
         int n = is.read(buf, 0, 1024);
@@ -403,75 +490,45 @@ public class McBatchSender {
         return out.toString();
     }
 
-    static void writeReportTextFile(String yyyymmdd, String data, String fileParam) throws IOException {
-        String name = reportFileName(yyyymmdd, fileParam);
-        try (PrintStream ps = new PrintStream(new FileOutputStream(name), true, "UTF-8")) {
-            ps.print(data);
-        }
+    static void writeReportFile(String yyyymmdd, String data, String fileParam) throws IOException {
+        String name = reportFileName(yyyymmdd, baseName(fileParam));
+        PrintStream ps = new PrintStream(new FileOutputStream(name), true, "UTF-8");
+        try { ps.print(data); } finally { ps.close(); }
         logger.info("Reporte escrito: " + name);
     }
 
     static void writeRawBytesFile(String yyyymmdd, byte[] data, String fileParam) throws IOException {
-        String out = (fileParam == null || fileParam.isEmpty()) ? "DESCARGA" : fileParam;
+        String out = baseName(fileParam);
+        if (out.length() == 0) out = "DESCARGA";
         String name = out + "-" + yyyymmdd + ".out";
-        try (FileOutputStream os = new FileOutputStream(name)) {
-            os.write(data);
-        }
+        FileOutputStream os = new FileOutputStream(name);
+        try { os.write(data); } finally { os.close(); }
         logger.info("Archivo escrito: " + name);
     }
 
     static boolean validateDate(String date) {
         if (date == null || date.length() != 8) return false;
-        try {
-            LocalDate.parse(date, DateTimeFormatter.ofPattern("yyyyMMdd"));
-            return true;
-        } catch (Exception e) { return false; }
+        try { LocalDate.parse(date, DateTimeFormatter.BASIC_ISO_DATE); return true; }
+        catch (Exception e) { return false; }
     }
 
-    public static void main(String[] args) {
+    static int parseInt(String s, int min, int max, String name) {
         try {
-            Path iniPath = Paths.get("mcsender.ini");
-            IniFile ini = IniFile.load(iniPath);
-            if (args == null || args.length == 0) {
-                Interactive.run(ini);
-                return;
-            }
-            int opc = Integer.parseInt(args[0]);
-            if (opc == 4 && args.length >= 4) {
-                General g = General.fromIni(ini);
-                String ip = args[1];
-                int port = Integer.parseInt(args[2]);
-                String fullName = args[3];
-                runManualSend(g, ip, port, fullName);
-                return;
-            }
-            if (args.length < 4) throw new IllegalArgumentException("Uso: <OPC> <SECCION> <FILE> <YYYYMMDD>");
-            String section = args[1].trim();
-            String fileName = args[2].trim();
-            String yyyymmdd = args[3].trim();
-            if (!validateDate(yyyymmdd)) throw new IllegalArgumentException("Fecha invalida");
-            General g = General.fromIni(ini);
-            Business b = Business.fromIni(ini, section);
-            switch (opc) {
-                case 1:
-                    runSend(g, b, fileName, yyyymmdd);
-                    break;
-                case 2:
-                    runReport(g, b, fileName, yyyymmdd);
-                    break;
-                case 3:
-                    runDownload(g, b, fileName, yyyymmdd);
-                    break;
-                default:
-                    throw new IllegalArgumentException("Opcion invalida");
-            }
+            int v = Integer.parseInt(s.trim());
+            if (v < min || v > max) throw new IllegalArgumentException(name + " fuera de rango: " + v);
+            return v;
         } catch (Exception e) {
-            logger.severe("Error: " + e.getMessage());
+            throw new IllegalArgumentException("Invalido " + name + ": " + s);
         }
     }
 
+    static String getOrEmpty(Map<String,String> m, String k) {
+        String v = m.get(k);
+        return v == null ? "" : v.trim();
+    }
+
     static class Interactive {
-        static void run(IniFile ini) throws Exception {
+        static void run() throws Exception {
             BufferedReader br = new BufferedReader(new InputStreamReader(System.in));
             System.out.println("1) Envio");
             System.out.println("2) Descarga + Reporte");
@@ -480,14 +537,15 @@ public class McBatchSender {
             System.out.print("Opcion: ");
             int op = Integer.parseInt(br.readLine().trim());
             if (op == 4) {
-                General g = General.fromIni(ini);
+                IniFile ini = IniFile.load(Paths.get("mcsender.ini"));
+                General g = General.from(ini);
                 System.out.print("IP: ");
                 String ip = br.readLine().trim();
                 System.out.print("Puerto: ");
                 int port = Integer.parseInt(br.readLine().trim());
                 System.out.print("Nombre completo a enviar: ");
                 String fullName = br.readLine().trim();
-                runManualSend(g, ip, port, fullName);
+                Sender.runManualSend(g, ip, port, fullName);
                 return;
             }
             System.out.print("Seccion: ");
@@ -497,17 +555,18 @@ public class McBatchSender {
             System.out.print("Fecha yyyymmdd: ");
             String date = br.readLine().trim();
             if (!validateDate(date)) throw new IllegalArgumentException("Fecha invalida");
-            General g = General.fromIni(ini);
-            Business b = Business.fromIni(ini, section);
+            IniFile ini = IniFile.load(Paths.get("mcsender.ini"));
+            General g = General.from(ini);
+            Business b = Business.from(ini, section);
             switch (op) {
                 case 1:
-                    runSend(g, b, file, date);
+                    Sender.runSend(g, b, file, date);
                     break;
                 case 2:
-                    runReport(g, b, file, date);
+                    Sender.runReport(g, b, file, date);
                     break;
                 case 3:
-                    runDownload(g, b, file, date);
+                    Sender.runDownload(g, b, file, date);
                     break;
                 default:
                     System.out.println("Opcion invalida");
@@ -516,18 +575,19 @@ public class McBatchSender {
     }
 
     static class IniFile {
-        Map<String, Map<String, String>> sections = new LinkedHashMap<>();
+        final Map<String, Map<String, String>> sections = new LinkedHashMap<String, Map<String, String>>();
+
         static IniFile load(Path p) throws IOException {
             IniFile ini = new IniFile();
             if (!Files.exists(p)) throw new FileNotFoundException("INI no encontrado: " + p.toString());
             List<String> lines = Files.readAllLines(p);
             String curr = null;
-            for (String l : lines) {
-                String s = l.trim();
-                if (s.isEmpty() || s.startsWith(";") || s.startsWith("#")) continue;
+            for (int i = 0; i < lines.size(); i++) {
+                String s = lines.get(i).trim();
+                if (s.length() == 0 || s.startsWith(";") || s.startsWith("#")) continue;
                 if (s.startsWith("[") && s.endsWith("]")) {
                     curr = s.substring(1, s.length() - 1).trim();
-                    ini.sections.putIfAbsent(curr, new LinkedHashMap<String,String>());
+                    if (!ini.sections.containsKey(curr)) ini.sections.put(curr, new LinkedHashMap<String, String>());
                     continue;
                 }
                 int eq = s.indexOf('=');
@@ -535,21 +595,26 @@ public class McBatchSender {
                 String k = s.substring(0, eq).trim();
                 String v = s.substring(eq + 1).trim();
                 if (curr == null) curr = "DEFAULT";
-                ini.sections.putIfAbsent(curr, new LinkedHashMap<String,String>());
-                ini.sections.get(curr).put(k, v);
+                Map<String, String> m = ini.sections.get(curr);
+                if (m == null) { m = new LinkedHashMap<String, String>(); ini.sections.put(curr, m); }
+                m.put(k, v);
             }
             return ini;
         }
+
         String get(String section, String key, String def) {
             Map<String,String> m = sections.get(section);
             if (m == null) return def;
             String v = m.get(key);
             return v == null ? def : v;
         }
+
         int getInt(String section, String key, int def) {
             try {
-                return Integer.parseInt(get(section,key,String.valueOf(def)).trim());
-            } catch (Exception e) { return def; }
+                return Integer.parseInt(get(section, key, String.valueOf(def)).trim());
+            } catch (Exception e) {
+                return def;
+            }
         }
     }
 }
