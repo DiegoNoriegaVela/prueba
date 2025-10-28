@@ -33,7 +33,8 @@ public class McBatchSender {
             String acc = ini.get("GENERAL","acceptedCode","");
             if (acc == null) acc = "";
             if (acc.contains(",")) {
-                for (String s : acc.split(",")) {
+                String[] arr = acc.split(",");
+                for (String s : arr) {
                     String t = s.trim();
                     if (!t.isEmpty()) g.acceptedCode.add(t);
                 }
@@ -46,12 +47,6 @@ public class McBatchSender {
             if (g.acceptedCode.isEmpty()) g.acceptedCode = Arrays.asList("9980100");
             return g;
         }
-    }
-
-    static class Host {
-        String name;
-        String host;
-        int port;
     }
 
     static class Business {
@@ -67,20 +62,21 @@ public class McBatchSender {
             if (m == null) throw new IllegalArgumentException("Seccion no encontrada: " + section);
             Business b = new Business();
             b.section = section;
-            String hostRef = m.getOrDefault("hostRef","").trim();
+            String hostRef = m.get("hostRef") == null ? "" : m.get("hostRef").trim();
             if (hostRef.isEmpty()) {
                 b.host = ini.get(section,"host","");
                 b.port = Integer.parseInt(ini.get(section,"port","0"));
             } else {
                 Map<String,String> hm = ini.sections.get(hostRef);
                 if (hm == null) throw new IllegalArgumentException("hostRef no encontrado: " + hostRef);
-                b.host = hm.getOrDefault("host","").trim();
-                b.port = Integer.parseInt(hm.getOrDefault("port","0").trim());
+                b.host = hm.get("host") == null ? "" : hm.get("host").trim();
+                String pv = hm.get("port") == null ? "0" : hm.get("port").trim();
+                b.port = Integer.parseInt(pv);
             }
-            b.originalFile = m.getOrDefault("originalFile","").trim();
-            b.historyFile = m.getOrDefault("historyFile","").trim();
-            b.formatSendMC = m.getOrDefault("formatSendMC","").trim();
-            b.formatRecieveMC = m.getOrDefault("formatRecieveMC","").trim();
+            b.originalFile = m.get("originalFile") == null ? "" : m.get("originalFile").trim();
+            b.historyFile = m.get("historyFile") == null ? "" : m.get("historyFile").trim();
+            b.formatSendMC = m.get("formatSendMC") == null ? "" : m.get("formatSendMC").trim();
+            b.formatRecieveMC = m.get("formatRecieveMC") == null ? "" : m.get("formatRecieveMC").trim();
             if (b.host.isEmpty() || b.port <= 0) throw new IllegalArgumentException("Host/Port invalidos en seccion: " + section);
             return b;
         }
@@ -457,10 +453,17 @@ public class McBatchSender {
             General g = General.fromIni(ini);
             Business b = Business.fromIni(ini, section);
             switch (opc) {
-                case 1 -> runSend(g, b, fileName, yyyymmdd);
-                case 2 -> runReport(g, b, fileName, yyyymmdd);
-                case 3 -> runDownload(g, b, fileName, yyyymmdd);
-                default -> throw new IllegalArgumentException("Opcion invalida");
+                case 1:
+                    runSend(g, b, fileName, yyyymmdd);
+                    break;
+                case 2:
+                    runReport(g, b, fileName, yyyymmdd);
+                    break;
+                case 3:
+                    runDownload(g, b, fileName, yyyymmdd);
+                    break;
+                default:
+                    throw new IllegalArgumentException("Opcion invalida");
             }
         } catch (Exception e) {
             logger.severe("Error: " + e.getMessage());
@@ -497,10 +500,17 @@ public class McBatchSender {
             General g = General.fromIni(ini);
             Business b = Business.fromIni(ini, section);
             switch (op) {
-                case 1 -> runSend(g, b, file, date);
-                case 2 -> runReport(g, b, file, date);
-                case 3 -> runDownload(g, b, file, date);
-                default -> System.out.println("Opcion invalida");
+                case 1:
+                    runSend(g, b, file, date);
+                    break;
+                case 2:
+                    runReport(g, b, file, date);
+                    break;
+                case 3:
+                    runDownload(g, b, file, date);
+                    break;
+                default:
+                    System.out.println("Opcion invalida");
             }
         }
     }
@@ -517,7 +527,7 @@ public class McBatchSender {
                 if (s.isEmpty() || s.startsWith(";") || s.startsWith("#")) continue;
                 if (s.startsWith("[") && s.endsWith("]")) {
                     curr = s.substring(1, s.length() - 1).trim();
-                    ini.sections.putIfAbsent(curr, new LinkedHashMap<>());
+                    ini.sections.putIfAbsent(curr, new LinkedHashMap<String,String>());
                     continue;
                 }
                 int eq = s.indexOf('=');
@@ -525,7 +535,7 @@ public class McBatchSender {
                 String k = s.substring(0, eq).trim();
                 String v = s.substring(eq + 1).trim();
                 if (curr == null) curr = "DEFAULT";
-                ini.sections.putIfAbsent(curr, new LinkedHashMap<>());
+                ini.sections.putIfAbsent(curr, new LinkedHashMap<String,String>());
                 ini.sections.get(curr).put(k, v);
             }
             return ini;
@@ -533,7 +543,8 @@ public class McBatchSender {
         String get(String section, String key, String def) {
             Map<String,String> m = sections.get(section);
             if (m == null) return def;
-            return m.getOrDefault(key, def);
+            String v = m.get(key);
+            return v == null ? def : v;
         }
         int getInt(String section, String key, int def) {
             try {
