@@ -784,20 +784,26 @@ public class McBatchSender {
             return header + headerInfo;
         }
         
-        // ✅ TODO lo que está ANTES de la "T" de "TH" va en los corchetes
-        String nameContent = data.substring(0, idxTH).trim();
-        String header = "[" + nameContent + "]\n";
+        // ✅ Extraer TODO lo que está ANTES de "TH"
+        String beforeTH = data.substring(0, idxTH);
         
-        // ✅ Desde la "T" (inicio de "TH") hasta el primer "D" (inicio de detalles)
-        int firstIndexDetail = data.indexOf("D", idxTH);
+        // ✅ Limpiar: remover corchetes [] y saltos de línea del nombre
+        String cleanName = beforeTH.replace("[", "").replace("]", "").replace("\n", "").trim();
+        
+        // ✅ Construir header con nombre limpio
+        String header = "[" + cleanName + "]\n";
+        
+        // ✅ Desde la "H" (saltando la "T") hasta el primer "D0"
+        int idxH = idxTH + 1; // +1 para saltar la "T" y empezar desde "H"
+        int firstIndexDetail = data.indexOf("D0", idxH);
         String headerInfo;
         
         if (firstIndexDetail != -1) {
-            // Desde "TH..." hasta antes del primer "D"
-            headerInfo = data.substring(idxTH, firstIndexDetail);
+            // Desde "H..." hasta antes del primer "D0"
+            headerInfo = data.substring(idxH, firstIndexDetail);
         } else {
-            // Si no hay "D", toma todo desde "TH" hasta el final
-            headerInfo = data.substring(idxTH);
+            // Si no hay "D0", toma todo desde "H" hasta el final
+            headerInfo = data.substring(idxH);
         }
         
         return header + headerInfo;
