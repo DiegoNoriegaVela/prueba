@@ -765,17 +765,41 @@ public class McBatchSender {
     }
 
     private static String extractHeadersMIP(String data) {
-        String name = extractBracketedName(data);
-        String header = "[" + name + "]\n";
-        int firstIndexDetail = data.indexOf("D");
-        int idxH = data.indexOf("H");
-        if (idxH == -1) idxH = 0;
-        String headerInfo;
-        if (firstIndexDetail != -1 && firstIndexDetail > idxH) {
-            headerInfo = data.substring(idxH, firstIndexDetail);
-        } else {
-            headerInfo = data.substring(idxH, data.indexOf("]", idxH));
+        // ✅ Buscar la primera ocurrencia de "TH"
+        int idxTH = data.indexOf("TH");
+        
+        if (idxTH == -1) {
+            // No encontró "TH", fallback al comportamiento anterior
+            String name = extractBracketedName(data);
+            String header = "[" + name + "]\n";
+            int firstIndexDetail = data.indexOf("D");
+            int idxH = data.indexOf("H");
+            if (idxH == -1) idxH = 0;
+            String headerInfo;
+            if (firstIndexDetail != -1 && firstIndexDetail > idxH) {
+                headerInfo = data.substring(idxH, firstIndexDetail);
+            } else {
+                headerInfo = data.substring(idxH, data.indexOf("]", idxH));
+            }
+            return header + headerInfo;
         }
+        
+        // ✅ TODO lo que está ANTES de la "T" de "TH" va en los corchetes
+        String nameContent = data.substring(0, idxTH).trim();
+        String header = "[" + nameContent + "]\n";
+        
+        // ✅ Desde la "T" (inicio de "TH") hasta el primer "D" (inicio de detalles)
+        int firstIndexDetail = data.indexOf("D", idxTH);
+        String headerInfo;
+        
+        if (firstIndexDetail != -1) {
+            // Desde "TH..." hasta antes del primer "D"
+            headerInfo = data.substring(idxTH, firstIndexDetail);
+        } else {
+            // Si no hay "D", toma todo desde "TH" hasta el final
+            headerInfo = data.substring(idxTH);
+        }
+        
         return header + headerInfo;
     }
 
