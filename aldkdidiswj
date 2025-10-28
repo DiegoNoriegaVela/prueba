@@ -55,12 +55,12 @@ public class McBatchSender {
             General general = General.from(ini);
             Business biz = Business.from(ini, section);
 
-            final boolean isMIP = isMIPSection(section); // <-- selecciona reglas por sección
+            final boolean isMIP = isMIPSection(section); // <-- reglas por sección
 
             if (option == 1) {
                 Sender.runSend(general, biz, fileParam, yyyymmdd);
             } else if (option == 2) {
-                Sender.runReport(general, biz, fileParam, yyyymmdd, isMIP); // <-- pasa el flag
+                Sender.runReport(general, biz, fileParam, yyyymmdd, isMIP); // <-- pasa flag
             } else if (option == 3) {
                 Sender.runDownload(general, biz, fileParam, yyyymmdd);
             } else {
@@ -180,7 +180,6 @@ public class McBatchSender {
     }
 
     // ============================== SENDER ==============================
-
     static class Sender {
 
         // ------------------- Opcion 1: Envio -------------------
@@ -263,7 +262,11 @@ public class McBatchSender {
             logger.info("Nombre base: " + base);
 
             boolean found = false;
-            StringBuilder rawAcc = new StringBuilder();
+            String foundName = null;
+            String foundChunk = null;
+
+            String lastTriedName = null;
+            String lastChunk = null;
 
             try (Socket sock = new Socket()) {
                 sock.connect(new InetSocketAddress(b.host, b.port), g.connectTimeoutMs);
@@ -272,17 +275,19 @@ public class McBatchSender {
                 for (int i = 1; i <= 99; i++) {
                     String sec = String.format("%02d", i);
                     String query = base + sec;
+                    lastTriedName = query;
 
                     logger.info("Consultando: " + query);
                     writeFrameName(sock, query);
 
-                    // lectura one-shot legacy y acumulación EXACTA como el original
+                    // lectura one-shot legacy (como en el original)
                     String chunk = readLegacyOneShot(sock);
-                    rawAcc.setLength(0);
-                    rawAcc.append("[").append(chunk).append("]\n");
+                    lastChunk = chunk;
 
-                    if (hasAccepted(rawAcc.toString(), g.acceptedCode)) {
+                    if (hasAccepted(chunk, g.acceptedCode) || hasAccepted("[" + chunk + "]", g.acceptedCode)) {
                         found = true;
+                        foundName = query;
+                        foundChunk = chunk;
                         break;
                     } else {
                         logger.info("Buscando...");
@@ -291,23 +296,25 @@ public class McBatchSender {
 
                 if (!found) {
                     logger.severe("*** Archivo no encontrado [FAIL]");
-                    String rr = rawAcc.toString(); // mantiene el formato con []
+                    String rr = "[" + (lastTriedName == null ? base : lastTriedName) + "]\n" + (lastChunk == null ? "" : lastChunk);
                     logger.info("[Preview 80B] " + preview80(rr));
                     writeErrorDump(fileParam, yyyymmdd, rr);
                     logger.info("=== FIN OPCION 2 ===");
                     return;
                 }
 
-                // Éxito: ordenar usando reglas GCO o MIP
+                // Encabezado EXACTO: el nombre consultado que SI encontró
+                String rawForReport = "[" + foundName + "]\n" + (foundChunk == null ? "" : foundChunk);
+
                 String dataToWrite;
                 String allOk = firstAcceptedOrDefault(g);
                 try {
                     dataToWrite = isMIP
-                            ? orderDetailsMIP(rawAcc.toString(), allOk)  // reglas MIP (H/D0)
-                            : orderDetails(rawAcc.toString(), allOk);    // reglas GCO (12/16)
+                            ? orderDetailsMIP(rawForReport, allOk)  // reglas MIP (H/D0)
+                            : orderDetails(rawForReport, allOk);    // reglas GCO (12/16)
                 } catch (Exception ex) {
                     logger.severe("Error al ordenar; se guarda crudo");
-                    dataToWrite = rawAcc.toString();
+                    dataToWrite = rawForReport;
                 }
 
                 // escribir reporte con nombre original
@@ -673,10 +680,10 @@ public class McBatchSender {
         return headers + details;
     }
 
-    // Encabezado EXACTO: "[<nombre>]\n" + bloque entre "12" y el primer "16"
+    // Encabezado GCO: "[<nombre_consultado>]\n" + bloque entre "12" y el primer "16"
     private static String extractHeaders(String data) {
-        // toma los primeros 20 caracteres (ya vienen con "[" al inicio por runReport)
-        String header = data.replace(">", "").substring(0, 20) + "]\n";
+        String name = extractBracketedName(data);
+        String header = "[" + name + "]\n";
         int firstIndexDetail = data.indexOf("16");
         String headerInfo;
         if (firstIndexDetail != -1) {
@@ -730,9 +737,10 @@ public class McBatchSender {
         return headers + details;
     }
 
-    // Header MIP: primera línea "[...]\n" + bloque desde 'H' hasta antes del primer 'D' (o hasta ']')
+    // Header MIP: "[<nombre_consultado>]\n" + bloque desde 'H' hasta antes del primer 'D' (o hasta ']')
     private static String extractHeadersMIP(String data) {
-        String header = data.replace(">", "").substring(0, 20) + "]\n";
+        String name = extractBracketedName(data);
+        String header = "[" + name + "]\n";
         int firstIndexDetail = data.indexOf("D");      // en MIP los detalles empiezan en 'D...'
         int idxH = data.indexOf("H");
         if (idxH == -1) idxH = 0;                      // defensivo
@@ -781,6 +789,16 @@ public class McBatchSender {
         return detail.toString();
     }
 
+    // -------- nombre entre corchetes de la primera línea --------
+    private static String extractBracketedName(String data) {
+        if (data == null) return "";
+        int lb = data.indexOf('[');
+        if (lb == -1) return "";
+        int rb = data.indexOf(']', lb + 1);
+        if (rb == -1) return "";
+        return data.substring(lb + 1, rb).trim();
+    }
+
     // ============================== INTERACTIVO ==============================
     static class Interactive {
         static void run() throws Exception {
@@ -827,7 +845,7 @@ public class McBatchSender {
                     : applyFormat(biz.formatRecieveMC, fileParam, date);
             System.out.println("Nombre exacto: " + preview);
 
-            boolean isMIP = isMIPSection(sec); // <-- reglas por sección en modo interactivo
+            boolean isMIP = isMIPSection(sec); // reglas por sección
 
             if (op == 1) Sender.runSend(general, biz, fileParam, date);
             else if (op == 2) Sender.runReport(general, biz, fileParam, date, isMIP);
