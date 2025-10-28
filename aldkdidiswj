@@ -1,57 +1,6 @@
-//=================================================================================================
-// McBatchSender
-//
-// Proposito:
-//   Cliente TCP simple para envio y descarga de archivos contra el hub (ej. Mastercard).
-//   - Opcion 1: Envio (particiona en tramas y envia trailer).
-//   - Opcion 2: Descarga y genera reporte (procesa headers+details).
-//   - Opcion 3: Descarga cruda (solo guarda lo recibido, sin parseo).
-//   - Opcion 4: Envio manual (host/puerto/archivo por consola).
-//
-// Protocolo de marco:
-//   Cada trama: header de 2 bytes (longitud big-endian) + cuerpo en EBCDIC.
-//   - Nombre: texto plano en EBCDIC.
-//   - Trama de datos: prefijo ASCII 'R' + bytes del archivo (todo convertido a EBCDIC).
-//   - Trailer 11B: 7 chars de acceptedCode + contador(4B) big-endian (los 4B pasan por
-//     translateByteForDiscrepancy para calzar con el legado).
-//
-// Notas de comportamiento:
-//   - La verificacion de exito ahora es estricta: solo se considera OK si la respuesta del
-//     servidor contiene al menos uno de los codigos en acceptedCode. Caso contrario, se registra
-//     preview de 80B y se crea un archivo ERROR_<FILE> con el cuerpo crudo.
-// 
-// Uso tipico:
-//   javac McBatchSender.java
-//   java McBatchSender <OPCION> <SECCION> <FILE> <YYYYMMDD>
-//   Si no pasas parametros, entra a modo interactivo (menu).
-//
-// Codigos de salida:
-//   0 OK | 2 uso invalido | 3 INI no encontrado | 4 config invalida | 1 error inesperado
-//=================================================================================================
-//=================================================================================================
-// McBatchSender
-//
-// Proposito (resumen):
-//   Flujo por TCP con 2B de encabezado big-endian y cuerpo en EBCDIC (mapeo manual).
-//   Opcion 1: Envio en tramas (prefijo 'R' ASCII por trama) + trailer 11B.
-//   Opcion 2: Descarga y genera reporte (parsea headers y detalles como el legado).
-//   Opcion 3: Descarga cruda (sin parseo), solo escribe si el servidor responde con acceptedCode.
-//   Opcion 4: Envio manual (host y puerto directos) usando parametros de [GENERAL].
-//
-// Notas clave de esta version:
-//   - Verifica exito por presencia de cualquier acceptedCode de [GENERAL].
-//   - Si NO hay acceptedCode: se muestra preview 80B y se genera ERROR_{FILE} con lo devuelto.
-//   - Menu interactivo renombrado: "Envio manual" (opcion 4).
-//   - Envio manual: CLI = <OPC> <HOST> <PUERTO> <FULL_NAME>, usa timeouts de [GENERAL].
-//   - INI: [GENERAL], [HOST_xxx] y secciones de negocio con formatos.
-//
-// Uso basico (CLI, formatos obligatorios):
-//   javac McBatchSender.java
-//   java McBatchSender <OPC> <SECCION> <FILE> <YYYYMMDD>
-//   Opcion 4 (envio manual): java McBatchSender 4 <IP> <PUERTO> <FULL_NAME>
-//
 import java.io.*;
 import java.net.*;
+import java.nio.charset.Charset;
 import java.nio.file.*;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
@@ -60,18 +9,15 @@ import java.util.logging.Logger;
 
 public class McBatchSender {
     private static final Logger logger = Logger.getLogger(McBatchSender.class.getName());
+    private static final Charset EBCDIC = Charset.forName("Cp037"); // IBM EBCDIC US/Canada (común en AS/400)
 
     // ============================== MAIN ==============================
-
     public static void main(String[] args) {
-        System.out.println("INICIA PROCESO");
-
         try {
             if (args == null || args.length == 0) {
                 Interactive.run();
                 return;
             }
-
             // Modo CLI
             int option = Integer.parseInt(args[0].trim());
 
@@ -125,8 +71,6 @@ public class McBatchSender {
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
             System.exit(1);
-        } finally {
-            System.out.println("PROCESO FINALIZADO");
         }
     }
 
@@ -153,9 +97,9 @@ public class McBatchSender {
             Map<String,String> g = ini.section("GENERAL");
             if (g == null) throw new IllegalArgumentException("Falta seccion [GENERAL]");
 
-            int cto = parseInt(g.getOrDefault("connectTimeoutMs","60000"), 1000, 300000, "connectTimeoutMs");
-            int sto = parseInt(g.getOrDefault("soTimeoutMs","60000"), 1000, 300000, "soTimeoutMs");
-            int chunk = parseInt(g.getOrDefault("chunkSize","980"), 1, 65535, "chunkSize");
+            int cto = parseIntStrict(g.getOrDefault("connectTimeoutMs","60000"), 1000, 300000, "connectTimeoutMs");
+            int sto = parseIntStrict(g.getOrDefault("soTimeoutMs","60000"), 1000, 300000, "soTimeoutMs");
+            int chunk = parseIntStrict(g.getOrDefault("chunkSize","980"), 2, 65535, "chunkSize");
             List<String> acc = parseList(g.getOrDefault("acceptedCode","9980100"));
             String already = g.getOrDefault("alreadySentSubstring","9288W");
             String fail = g.getOrDefault("defaultFailCode","9980101");
@@ -189,7 +133,7 @@ public class McBatchSender {
             Map<String,String> hs = ini.section(hostSec);
             if (hs == null) throw new IllegalArgumentException("No existe la seccion ["+hostSec+"]");
             String host = req(hs, "host");
-            int port = parseInt(req(hs, "port"), 1, 65535, "port");
+            int port = parseIntStrict(req(hs, "port"), 1, 65535, "port");
 
             String of = req(s, "originalFile");
             String hf = req(s, "historyFile");
@@ -286,7 +230,7 @@ public class McBatchSender {
                 // 3) Trailer (accepted + count)
                 writeTrailer(sock, count);
 
-                // 4) Leer respuesta
+                // 4) Leer respuesta (completa)
                 String resp = readResponse(sock);
                 logger.info("Resp (envio): " + preview80(resp));
 
@@ -317,7 +261,7 @@ public class McBatchSender {
             logger.info("Nombre base: " + base);
 
             boolean found = false;
-            StringBuilder rawAcc = new StringBuilder();
+            String lastChunk = null;
 
             try (Socket sock = new Socket()) {
                 sock.connect(new InetSocketAddress(b.host, b.port), g.connectTimeoutMs);
@@ -330,12 +274,11 @@ public class McBatchSender {
                     logger.info("Consultando: " + query);
                     writeFrameName(sock, query);
 
-                    // lectura one-shot legacy y filtro
+                    // lectura legacy (como estaba), si quieres total, cambia a readResponse
                     String chunk = readLegacyOneShot(sock);
-                    rawAcc.setLength(0);
-                    rawAcc.append("[").append(chunk).append("]\n");
+                    lastChunk = chunk;
 
-                    if (hasAccepted(rawAcc.toString(), g.acceptedCode)) {
+                    if (hasAccepted(chunk, g.acceptedCode)) {
                         found = true;
                         break;
                     } else {
@@ -345,25 +288,21 @@ public class McBatchSender {
 
                 if (!found) {
                     logger.severe("*** Archivo no encontrado [FAIL]");
-                    // preview y dump de error
-                    String rr = rawAcc.toString();
-                    logger.info("[Preview 80B] " + preview80(rr));
-                    writeErrorDump(fileParam, yyyymmdd, rr);
+                    logger.info("[Preview 80B] " + preview80(lastChunk));
+                    writeErrorDump(fileParam, yyyymmdd, lastChunk);
                     logger.info("=== FIN OPCION 2 ===");
                     return;
                 }
 
-                // Exito: procesar como legado
+                // Exito: procesar como legado (ordenar)
                 String dataToWrite;
                 try {
-                    dataToWrite = orderDetails(rawAcc.toString(), firstAcceptedOrDefault(g));
+                    dataToWrite = orderDetails(lastChunk, firstAcceptedOrDefault(g));
                 } catch (Exception ex) {
-                    // fallback crudo
                     logger.severe("Error al ordenar; se guarda crudo");
-                    dataToWrite = rawAcc.toString();
+                    dataToWrite = lastChunk;
                 }
 
-                // escribir reporte con nombre original
                 writeReportFile(yyyymmdd, dataToWrite, fileParam);
                 logger.info("Reporte OK");
 
@@ -374,7 +313,7 @@ public class McBatchSender {
             }
         }
 
-        // ------------------- Opcion 3: Descarga (cruda, ahora con busqueda secuencial + lectura completa) -------------------
+        // ------------------- Opcion 3: Descarga (cruda, con busqueda secuencial + lectura completa) -------------------
         static void runDownload(General g, Business b, String fileParam, String yyyymmdd) {
             logger.info("=== OPCION 3: Descarga ===");
             logger.info("Host: " + b.host + " Puerto: " + b.port);
@@ -436,7 +375,7 @@ public class McBatchSender {
             logger.info("=== OPCION 4: Envio manual ===");
             logger.info("Host: " + ip + " Puerto: " + port);
             logger.info("Nombre a enviar: " + fullName);
-        
+
             try (Socket sock = new Socket()) {
                 sock.connect(new InetSocketAddress(ip, port), g.connectTimeoutMs);
                 sock.setSoTimeout(g.soTimeoutMs);
@@ -445,12 +384,12 @@ public class McBatchSender {
 
                 // leer bloque de respuesta completo
                 String raw = readResponse(sock);
-        
+
                 // Escribir exactamente en el archivo indicado por 'fullName'
                 try (PrintStream ps = new PrintStream(new FileOutputStream(fullName), true, "UTF-8")) {
                     ps.print(raw == null ? "" : raw);
                 }
-        
+
                 // Log compacto de la respuesta
                 logger.info("Resp: [" + (raw == null ? "" : raw.trim()) + "]");
             } catch (Exception ex) {
@@ -460,12 +399,11 @@ public class McBatchSender {
             }
         }
 
-
-        // ==================== I/O de red y framing (EBCDIC manual) ====================
+        // ==================== I/O de red y framing ====================
 
         private static void writeFrameName(Socket s, String name) throws IOException {
-            // nombre en EBCDIC (mapeo manual) con header 2B
-            byte[] body = toEbcdic(name.getBytes());
+            // nombre en EBCDIC con header 2B
+            byte[] body = toEbcdic(name.getBytes("UTF-8"));
             writeRawFrame(s, body);
         }
 
@@ -476,9 +414,9 @@ public class McBatchSender {
         }
 
         private static void writeTrailer(Socket s, int count) throws IOException {
-            // 11B = "9980100"(7) + contador BE(4), pero los 4 ultimos se traducen segun discrepancia
+            // 11B = "9980100"(7) + contador BE(4), con posible traduccion adicional por discrepancia
             String ok = "9980100";
-            byte[] pre = toEbcdic(ok.getBytes());
+            byte[] pre = toEbcdic(ok.getBytes("UTF-8"));
             byte[] cntBE = intToBytesBE(count, 4);
             for (int i = 0; i < cntBE.length; i++) {
                 cntBE[i] = (byte) translateByteForDiscrepancy(cntBE[i] & 0xFF);
@@ -502,20 +440,21 @@ public class McBatchSender {
         private static String readResponse(Socket s) throws IOException {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             InputStream is = s.getInputStream();
-            byte[] buf = new byte[1024];
+            byte[] buf = new byte[4096];
             int n;
             while (true) {
                 try {
                     n = is.read(buf);
                     if (n == -1) break;
                     baos.write(buf, 0, n);
-                    if (n < buf.length) break;
+                    if (n < buf.length) break; // leyó menos que el buffer -> no hay mas disponible inmediato
                 } catch (SocketTimeoutException te) {
                     if (baos.size() == 0) throw te;
                     break;
                 }
             }
             byte[] ebcdicBytes = baos.toByteArray();
+            if (ebcdicBytes.length == 0) return "";
             return fromEbcdic(ebcdicBytes);
         }
 
@@ -525,6 +464,7 @@ public class McBatchSender {
             int n = is.read(buf, 0, 1024);
             if (n <= 0) return "";
             String decoded = fromEbcdic(Arrays.copyOf(buf, n));
+            // Sanitizar a ASCII visible + saltos de linea
             StringBuilder out = new StringBuilder(decoded.length());
             for (int i = 0; i < decoded.length(); i++) {
                 char c = decoded.charAt(i);
@@ -543,9 +483,10 @@ public class McBatchSender {
 
         private static List<byte[]> splitWithPrefixR(byte[] payload, int chunkSize) {
             List<byte[]> out = new ArrayList<>();
+            int maxDataPerChunk = Math.max(1, chunkSize - 1); // 1 para 'R'
             int pos = 0;
             while (pos < payload.length) {
-                int len = Math.min(chunkSize-1, payload.length - pos);
+                int len = Math.min(maxDataPerChunk, payload.length - pos);
                 byte[] part = new byte[len + 1];
                 part[0] = 'R'; // prefijo ASCII
                 System.arraycopy(payload, pos, part, 1, len);
@@ -558,7 +499,7 @@ public class McBatchSender {
         private static void writeReportFile(String yyyymmdd, String content, String fileName9) throws IOException {
             String name = reportFileName(yyyymmdd, fileName9);
             try (PrintStream ps = new PrintStream(new FileOutputStream(name), true, "UTF-8")) {
-                ps.print(content);
+                ps.print(content == null ? "" : content);
             }
             logger.info("Reporte escrito: " + name);
         }
@@ -567,7 +508,7 @@ public class McBatchSender {
             String out = (fileParam == null || fileParam.isEmpty()) ? "DESCARGA" : fileParam;
             String name = out + "-" + yyyymmdd + ".out";
             try (PrintStream ps = new PrintStream(new FileOutputStream(name), true, "UTF-8")) {
-                ps.print(data);
+                ps.print(data == null ? "" : data);
             }
             logger.info("Archivo escrito: " + name);
         }
@@ -595,72 +536,6 @@ public class McBatchSender {
         private static String reportFileName(String yyyymmdd, String fileName9) {
             String prefix = (fileName9 == null || fileName9.length() < 4) ? "FILE" : fileName9.substring(0, 4);
             return prefix + "-" + yyyymmdd + "-Archivo de Cambio Confirmacion";
-        }
-
-        // ==================== Utilidades varias ====================
-
-        private static String firstAcceptedOrDefault(General g) {
-            return (g.acceptedCode != null && !g.acceptedCode.isEmpty()) ? g.acceptedCode.get(0) : g.defaultFailCode;
-        }
-
-        private static int parseInt(String s, int min, int max, String k) {
-            int v = Integer.parseInt(s.trim());
-            if (v < min || v > max) throw new IllegalArgumentException("Parametro fuera de rango: " + k);
-            return v;
-        }
-    }
-
-    // ============================== INTERACTIVO ==============================
-
-    static class Interactive {
-        static void run() throws Exception {
-            IniFile ini = IniFile.load(Paths.get("mcsender.ini"));
-            General general = General.from(ini);
-            Scanner sc = new Scanner(System.in);
-
-            System.out.println("1) Envio");
-            System.out.println("2) Descarga y genera reporte");
-            System.out.println("3) Descarga");
-            System.out.println("4) Envio manual");
-            System.out.print("Opcion: ");
-            int op = Integer.parseInt(sc.nextLine().trim());
-
-            if (op == 4) {
-                System.out.print("IP: ");
-                String ip = sc.nextLine().trim();
-                System.out.print("Puerto: ");
-                int port = Integer.parseInt(sc.nextLine().trim());
-                System.out.print("Nombre completo a enviar: ");
-                String full = sc.nextLine().trim();
-                Sender.runManualSend(general, ip, port, full);
-                return;
-            }
-
-            System.out.print("Seccion INI: ");
-            String sec = sc.nextLine().trim();
-            System.out.print("FILE param : ");
-            String fileParam = sc.nextLine().trim();
-            System.out.print("Fecha (YYYYMMDD): ");
-            String date = sc.nextLine().trim();
-
-            IniFile ini2 = IniFile.load(Paths.get("mcsender.ini"));
-            Business biz = Business.from(ini2, sec);
-
-            if (!validateDate(date)) {
-                System.err.println("Fecha invalida");
-                return;
-            }
-
-            // Mostrar nombre exacto a consultar/enviar
-            String preview = (op == 1)
-                    ? applyFormat(biz.formatSendMC, fileParam, date)
-                    : applyFormat(biz.formatRecieveMC, fileParam, date);
-            System.out.println("Nombre exacto: " + preview);
-
-            if (op == 1) Sender.runSend(general, biz, fileParam, date);
-            else if (op == 2) Sender.runReport(general, biz, fileParam, date);
-            else if (op == 3) Sender.runDownload(general, biz, fileParam, date);
-            else System.err.println("Opcion invalida");
         }
     }
 
@@ -711,39 +586,23 @@ public class McBatchSender {
                 .replace("{dd}", dd);
     }
 
-    // EBCDIC manual (mapeo de tu GCO_MIP original)
+    // Conversion EBCDIC/ASCII usando Charset
     private static byte[] toEbcdic(byte[] ascii) {
-        byte[] out = new byte[ascii.length];
-        for (int i = 0; i < ascii.length; i++) {
-            out[i] = (byte) translateByte("toEBC", ascii[i]);
-        }
-        return out;
+        if (ascii == null || ascii.length == 0) return new byte[0];
+        String asStr = new String(ascii, Charset.forName("UTF-8"));
+        return asStr.getBytes(EBCDIC);
     }
     private static String fromEbcdic(byte[] ebcdic) {
-        StringBuilder sb = new StringBuilder(ebcdic.length);
-        for (byte b : ebcdic) {
-            int asc = translateByte("toASC", b & 0xFF);
-            sb.append((char) asc);
-        }
-        return sb.toString();
-    }
-    private static int translateByte(final String translationType, final int paramInt) {
-        final int[] asciiArray  = { 32, 33,  34,  35, 36,  37, 38,  39, 40, 41, 42, 43,  44, 45, 46, 47,  48,  49,  50,  51,  52,  53,  54,  55,  56,  57,  58, 59, 60,  61,  62,  63,  64,  65,  66,  67,  68,  69,  70,  71,  72,  73,  74,  75,  76,  77,  78,  79,  80,  81,  82,  83,  84,  85,  86,  87,  88,  89,  90,  91,  92,  93, 94,  95,  96,  97,  98,  99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126 };
-        final int[] ebcdicArray = { 64, 90, 127, 123, 91, 108, 80, 125, 77, 93, 92, 78, 107, 96, 75, 97, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 122, 94, 76, 126, 110, 111, 124, 193, 194, 195, 196, 197, 198, 199, 200, 201, 209, 210, 211, 212, 213, 214, 215, 216, 217, 226, 227, 228, 229, 230, 231, 232, 233, 173, 224, 189, 95, 109, 121, 129, 130, 131, 132, 133, 134, 135, 136, 137, 145, 146, 147, 148, 149, 150, 151, 152, 153, 162, 163, 164, 165, 166, 167, 168, 169, 192, 106, 208, 161 };
-        for (int i = 0; i < asciiArray.length; i++) {
-            if (translationType.equals("toEBC")) { if (paramInt == asciiArray[i]) return ebcdicArray[i]; }
-            else { if (paramInt == ebcdicArray[i]) return asciiArray[i]; }
-        }
-        return paramInt;
-    }
-    private static int translateByteForDiscrepancy(final int paramInt) {
-        int[] discrepancyArray = new int[126];
-        // (… tu contenido original …)
-        for (int j : discrepancyArray) if (paramInt == j) return j;
-        return paramInt;
+        if (ebcdic == null || ebcdic.length == 0) return "";
+        return new String(ebcdic, EBCDIC);
     }
 
-    // parse helpers
+    // Discrepancia de bytes (identidad por defecto; ajusta si necesitas)
+    private static int translateByteForDiscrepancy(final int paramInt) {
+        return paramInt; // mantener identidad salvo reglas especiales
+    }
+
+    // parse helpers y utilidades basicas
     private static boolean validateDate(String date) {
         try { LocalDate.parse(date, DateTimeFormatter.BASIC_ISO_DATE); return true; }
         catch (Exception e) { return false; }
@@ -757,38 +616,113 @@ public class McBatchSender {
         }
         return out;
     }
+    private static String req(Map<String,String> m, String key) {
+        String v = (m == null) ? null : m.get(key);
+        if (v == null || v.trim().isEmpty())
+            throw new IllegalArgumentException("Falta clave obligatoria: " + key);
+        return v.trim();
+    }
+    private static int parseIntStrict(String s, int min, int max, String k) {
+        int v = Integer.parseInt(s.trim());
+        if (v < min || v > max) throw new IllegalArgumentException("Parametro fuera de rango: " + k + " ("+v+")");
+        return v;
+    }
+    private static byte[] intToBytesBE(int value, int size) {
+        if (size <= 0 || size > 8) throw new IllegalArgumentException("size invalido");
+        byte[] out = new byte[size];
+        for (int i = 0; i < size; i++) {
+            int shift = (size - 1 - i) * 8;
+            out[i] = (byte)((value >> shift) & 0xFF);
+        }
+        return out;
+    }
+
+    // Reordenamiento de detalles (mantener firma y logica original aproximada)
     private static String orderDetails(String data, String allOkCode) {
-        // (… tu logica original intacta …)
+        if (data == null) return "";
         String[] detailsData = data.split("D0");
-        String header = detailsData[0] + "D0";
+        if (detailsData.length == 0) return data;
         StringBuilder detail = new StringBuilder();
         if (detailsData.length > 1) {
             for (int i = 1; i < detailsData.length; i++) {
                 if (detailsData[i] != null && detailsData[i].length() >= 83) {
                     if ((detailsData[i].substring(0, 2)).equals("D9")) {
                         detail.append(detailsData[i].substring(0, 83));
-                        String a = detailsData[i].substring(83, detailsData[i].length());
+                        String a = detailsData[i].substring(83);
                         if (a.contains(allOkCode)) {
-                            detail.append(a.substring(0, a.indexOf(allOkCode) + allOkCode.length()));
+                            detail.append(a, 0, a.indexOf(allOkCode) + allOkCode.length());
                         }
                     } else if ((detailsData[i].substring(0, 2)).equals("D1")) {
                         detail.append(detailsData[i].substring(0, 83));
-                        String a = detailsData[i].substring(83, detailsData[i].length());
+                        String a = detailsData[i].substring(83);
                         if (a.contains(allOkCode)) {
-                            detail.append(a.substring(0, a.indexOf(allOkCode) + allOkCode.length()));
+                            detail.append(a, 0, a.indexOf(allOkCode) + allOkCode.length());
                         }
                     } else {
                         int codresp = detailsData[i].indexOf(allOkCode);
                         if (codresp != -1) {
-                            detail.append(detailsData[i].substring(0, codresp + allOkCode.length()));
+                            detail.append(detailsData[i], 0, codresp + allOkCode.length());
                         }
                     }
                     break;
                 }
-                detail.append(detailsData[i].substring(0, 83));
+                detail.append(detailsData[i].substring(0, Math.min(83, detailsData[i].length())));
             }
             return detail.toString().replace("D0", "\nD0");
         }
         return detail.toString();
+    }
+
+    // ============================== INTERACTIVO ==============================
+    static class Interactive {
+        static void run() throws Exception {
+            IniFile ini = IniFile.load(Paths.get("mcsender.ini"));
+            General general = General.from(ini);
+            Scanner sc = new Scanner(System.in);
+
+            System.out.println("1) Envio");
+            System.out.println("2) Descarga y genera reporte");
+            System.out.println("3) Descarga");
+            System.out.println("4) Envio manual");
+            System.out.print("Opcion: ");
+            int op = Integer.parseInt(sc.nextLine().trim());
+
+            if (op == 4) {
+                System.out.print("IP: ");
+                String ip = sc.nextLine().trim();
+                System.out.print("Puerto: ");
+                int port = Integer.parseInt(sc.nextLine().trim());
+                System.out.print("Nombre completo a enviar: ");
+                String full = sc.nextLine().trim();
+                Sender.runManualSend(general, ip, port, full);
+                return;
+            }
+
+            System.out.print("Seccion INI: ");
+            String sec = sc.nextLine().trim();
+            System.out.print("FILE param : ");
+            String fileParam = sc.nextLine().trim();
+            System.out.print("Fecha (YYYYMMDD): ");
+            String date = sc.nextLine().trim();
+
+            IniFile ini2 = IniFile.load(Paths.get("mcsender.ini"));
+            Business biz = Business.from(ini2, sec);
+
+            if (!validateDate(date)) {
+                System.err.println("Fecha invalida");
+                return;
+            }
+
+            // Mostrar nombre exacto a consultar/enviar
+            String preview = (op == 1)
+                    ? applyFormat(biz.formatSendMC, fileParam, date)
+                    : applyFormat(biz.formatRecieveMC, fileParam, date);
+            System.out.println("Nombre exacto: " + preview);
+
+            if (op == 1) Sender.runSend(general, biz, fileParam, date);
+            else if (op == 2) Sender.runReport(general, biz, fileParam, date);
+            else if (op == 3) Sender.runDownload(general, biz, fileParam, date);
+            else System.err.println("Opcion invalida");
+        }
     }
 }
