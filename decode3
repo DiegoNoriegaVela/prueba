@@ -1,0 +1,349 @@
+import java.io.*;
+import java.nio.charset.Charset;
+import java.util.ArrayList;
+import java.util.List;
+
+public class Rdw1014Tool {
+
+    private static final int BLOCK_SIZE = 1014;
+    private static final int DATA_PER_BLOCK = 1012;
+    private static final byte PAD_40 = 0x40;
+
+    private enum Blocked1014 { AUTO, TRUE, FALSE }
+    private enum RdwVariant { AUTO, IPM, IBM }
+
+    public static void main(String[] args) {
+        if (args.length == 0 || "help".equalsIgnoreCase(args[0])) {
+            printHelp();
+            return;
+        }
+        String cmd = args[0].toLowerCase();
+        if (!"decode".equals(cmd)) {
+            System.err.println("Comando no soportado: " + cmd);
+            printHelp();
+            System.exit(2);
+        }
+
+        // Defaults
+        String inputPath = null;
+        String outDir = "out";
+        String encoding = "Cp500";       // EBCDIC (CCSID 500/1148 aprox.)
+        Blocked1014 blocked = Blocked1014.AUTO;
+        RdwVariant rdw = RdwVariant.AUTO;
+        boolean writeText = true;        // generar .ebcdic.txt y .ascii.txt
+
+        // Flags (compatibles con Java 6/7)
+        int i = 1;
+        while (i < args.length) {
+            String a = args[i];
+            if ("--input".equals(a) && i + 1 < args.length) {
+                inputPath = args[++i];
+            } else if ("--outdir".equals(a) && i + 1 < args.length) {
+                outDir = args[++i];
+            } else if ("--encoding".equals(a) && i + 1 < args.length) {
+                encoding = args[++i];
+            } else if ("--blocked".equals(a) && i + 1 < args.length) {
+                String b = args[++i].toLowerCase();
+                if ("true".equals(b)) blocked = Blocked1014.TRUE;
+                else if ("false".equals(b)) blocked = Blocked1014.FALSE;
+                else blocked = Blocked1014.AUTO;
+            } else if ("--rdw".equals(a) && i + 1 < args.length) {
+                String r = args[++i].toLowerCase();
+                if ("ipm".equals(r)) rdw = RdwVariant.IPM;
+                else if ("ibm".equals(r)) rdw = RdwVariant.IBM;
+                else rdw = RdwVariant.AUTO;
+            } else if ("--txt".equals(a) && i + 1 < args.length) {
+                String t = args[++i].toLowerCase();
+                writeText = !"no".equals(t) && !"false".equals(t);
+            } else {
+                System.err.println("Flag desconocida o valor faltante: " + a);
+                printHelp();
+                System.exit(2);
+            }
+            i++;
+        }
+
+        if (inputPath == null) {
+            System.err.println("Falta --input <ruta>");
+            printHelp();
+            System.exit(2);
+        }
+
+        try {
+            // Crear carpeta salida
+            File out = new File(outDir);
+            if (!out.exists()) out.mkdirs();
+
+            byte[] raw = readAllBytes(new File(inputPath));
+            System.out.println("Archivo: " + inputPath + " (" + raw.length + " bytes)");
+
+            // 1) Detectar / quitar 1014-blocking
+            boolean isBlocked = decideBlocked(raw, blocked);
+            System.out.println("1014-blocked: " + isBlocked + " (modo " + blocked + ")");
+            byte[] vbs = isBlocked ? remove1014Blocking(raw) : raw;
+
+            // 2) Detectar variante RDW
+            RdwVariant variant = decideRdw(vbs, rdw);
+            System.out.println("Variante RDW: " + variant);
+
+            // 3) Parsear registros
+            List<byte[]> records = parseVbs(vbs, variant);
+
+            // 4) Guardar registros y reporte
+            Charset cs;
+            try { cs = Charset.forName(encoding); }
+            catch (Exception e) { System.err.println("Encoding no válido ("+encoding+"), usando Cp500."); cs = Charset.forName("Cp500"); }
+
+            File report = new File(out, "report.txt");
+            BufferedWriter w = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(report), "UTF-8"));
+            try {
+                w.write("Archivo: " + inputPath + "\n");
+                w.write("Tamaño original: " + raw.length + " bytes\n");
+                w.write("1014-blocked: " + isBlocked + "\n");
+                w.write("Variante RDW: " + variant + "\n");
+                w.write("Registros: " + records.size() + "\n");
+                w.write("Encoding preview: " + cs.displayName() + "\n");
+                w.write("------------------------------------------------------------\n");
+
+                int idxRec = 1;
+                for (int k = 0; k < records.size(); k++) {
+                    byte[] rec = records.get(k);
+
+                    // BIN
+                    File fbin = new File(out, String.format("record_%04d.bin", idxRec));
+                    writeAllBytes(fbin, rec);
+
+                    // HEX
+                    File fhx = new File(out, String.format("record_%04d.hex.txt", idxRec));
+                    writeHexDump(fhx, rec);
+
+                    // TXT (EBCDIC->Unicode) y ASCII legible
+                    if (writeText) {
+                        String ebcdicText = decodeToString(rec, cs);
+                        String asciiText  = toAsciiPrintable(ebcdicText);
+
+                        File febc = new File(out, String.format("record_%04d.ebcdic.txt", idxRec));
+                        BufferedWriter we = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(febc), "UTF-8"));
+                        try { we.write(ebcdicText); } finally { try { we.close(); } catch (Exception ex) {} }
+
+                        File fasc = new File(out, String.format("record_%04d.ascii.txt", idxRec));
+                        BufferedWriter wa = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(fasc), "US-ASCII"));
+                        try { wa.write(asciiText); } finally { try { wa.close(); } catch (Exception ex) {} }
+                    }
+
+                    // preview al reporte
+                    String preview = previewText(rec, cs, 64);
+                    w.write(String.format("#%04d  len=%d  -> %s\n", idxRec, rec.length, preview));
+
+                    idxRec++;
+                }
+            } finally {
+                try { w.close(); } catch (Exception ex) {}
+            }
+
+            System.out.println("OK. Registros y vistas en: " + out.getAbsolutePath());
+            System.out.println("Archivos .ebcdic.txt = decodificados con "+cs.displayName()+".  .ascii.txt = versión ASCII imprimible.");
+
+        } catch (Exception e) {
+            System.err.println("Fallo: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(1);
+        }
+    }
+
+    private static void printHelp() {
+        System.out.println(
+          "Uso:\n" +
+          "  java Rdw1014Tool decode --input <ruta> [--outdir out] [--encoding Cp500]\n" +
+          "                          [--blocked auto|true|false] [--rdw auto|ipm|ibm]\n" +
+          "                          [--txt yes|no]\n\n" +
+          "Notas:\n" +
+          "  --encoding : CCSID para decodificar texto (Cp500, Cp1148, Cp037, Cp284, Cp1047...).\n" +
+          "  --blocked  : auto (detecta), true (forzar quitar 1014), false (no quitar).\n" +
+          "  --rdw      : auto (detecta), ipm (RDW 4 bytes = len payload), ibm (2+2 clásico).\n" +
+          "  --txt      : yes/no para generar .ebcdic.txt y .ascii.txt por registro (default yes).\n"
+        );
+    }
+
+    /* ================== IO helpers (sin java.nio) ================== */
+
+    private static byte[] readAllBytes(File f) throws IOException {
+        ByteArrayOutputStream bout = new ByteArrayOutputStream((int)Math.min(f.length(), 64*1024));
+        byte[] buf = new byte[8192];
+        InputStream in = new FileInputStream(f);
+        try {
+            int n;
+            while ((n = in.read(buf)) >= 0) {
+                if (n == 0) continue;
+                bout.write(buf, 0, n);
+            }
+        } finally { try { in.close(); } catch (Exception ex) {} }
+        return bout.toByteArray();
+    }
+
+    private static void writeAllBytes(File f, byte[] data) throws IOException {
+        OutputStream out = new FileOutputStream(f);
+        try { out.write(data); } finally { try { out.close(); } catch (Exception ex) {} }
+    }
+
+    /* ================== 1014-blocking ================== */
+
+    private static boolean decideBlocked(byte[] raw, Blocked1014 mode) {
+        if (mode == Blocked1014.TRUE) return true;
+        if (mode == Blocked1014.FALSE) return false;
+
+        // AUTO: heurística simple
+        if (raw.length >= BLOCK_SIZE && raw.length % BLOCK_SIZE == 0) {
+            int blocks = raw.length / BLOCK_SIZE;
+            int checks = Math.min(8, blocks);
+            int hits = 0;
+            for (int i = 0; i < checks; i++) {
+                int end = (i + 1) * BLOCK_SIZE;
+                byte b1 = raw[end - 2];
+                byte b2 = raw[end - 1];
+                if (b1 == PAD_40 && b2 == PAD_40) hits++;
+            }
+            return hits >= Math.max(3, checks - 1);
+        }
+        return false;
+    }
+
+    private static byte[] remove1014Blocking(byte[] raw) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(raw.length);
+        int pos = 0;
+        while (pos < raw.length) {
+            int remaining = raw.length - pos;
+            if (remaining >= BLOCK_SIZE) {
+                out.write(raw, pos, DATA_PER_BLOCK); // 1012 datos
+                pos += BLOCK_SIZE;                    // saltar +2 pad
+            } else {
+                int take = remaining < DATA_PER_BLOCK ? remaining : DATA_PER_BLOCK;
+                if (take > 0) out.write(raw, pos, take);
+                pos += remaining;
+            }
+        }
+        return out.toByteArray();
+    }
+
+    /* ================== RDW detection & parse ================== */
+
+    private static RdwVariant decideRdw(byte[] vbs, RdwVariant mode) {
+        if (mode != RdwVariant.AUTO) return mode;
+        if (vbs.length < 4) return RdwVariant.IPM;
+
+        int b0 = vbs[0] & 0xFF, b1 = vbs[1] & 0xFF, b2 = vbs[2] & 0xFF, b3 = vbs[3] & 0xFF;
+
+        int lenIBM = (b0 << 8) | b1;
+        boolean looksIBM = (b2 == 0 && b3 == 0 && lenIBM >= 4 && lenIBM <= vbs.length);
+
+        int lenIPM = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+        boolean looksIPM = (lenIPM > 0 && lenIPM <= vbs.length);
+
+        if (looksIPM && !looksIBM) return RdwVariant.IPM;
+        if (looksIBM && !looksIPM) return RdwVariant.IBM;
+        return RdwVariant.IPM; // preferimos IPM si ambos pueden calzar
+    }
+
+    private static List<byte[]> parseVbs(byte[] vbs, RdwVariant variant) throws IOException {
+        List<byte[]> records = new ArrayList<byte[]>();
+        int pos = 0;
+
+        while (pos + 4 <= vbs.length) {
+            if (variant == RdwVariant.IPM) {
+                int len = ((vbs[pos] & 0xFF) << 24) | ((vbs[pos + 1] & 0xFF) << 16)
+                        | ((vbs[pos + 2] & 0xFF) << 8) | (vbs[pos + 3] & 0xFF);
+                pos += 4;
+
+                if (len == 0) break; // EOF RDW
+
+                if (len < 0 || pos + len > vbs.length) {
+                    throw new IOException("RDW(IPM) inválido en pos " + (pos - 4) + " len=" + len);
+                }
+                byte[] rec = new byte[len];
+                System.arraycopy(vbs, pos, rec, 0, len);
+                pos += len;
+                records.add(rec);
+
+            } else { // IBM 2+2
+                int total = ((vbs[pos] & 0xFF) << 8) | (vbs[pos + 1] & 0xFF);
+                int flags = ((vbs[pos + 2] & 0xFF) << 8) | (vbs[pos + 3] & 0xFF);
+                pos += 4;
+
+                if (total < 4 || pos + (total - 4) > vbs.length) {
+                    throw new IOException("RDW(IBM) inválido en pos " + (pos - 4) + " total=" + total + " flags=" + flags);
+                }
+                int payloadLen = total - 4;
+                byte[] rec = new byte[payloadLen];
+                System.arraycopy(vbs, pos, rec, 0, payloadLen);
+                pos += payloadLen;
+                records.add(rec);
+            }
+        }
+        return records;
+    }
+
+    /* ================== Text helpers ================== */
+
+    private static String decodeToString(byte[] data, Charset cs) {
+        try {
+            return new String(data, cs);
+        } catch (Exception e) {
+            return "(no decodificable con " + cs.displayName() + ": " + e.getMessage() + ")";
+        }
+    }
+
+    private static String toAsciiPrintable(String s) {
+        if (s == null) return "";
+        StringBuffer sb = new StringBuffer(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            // Conservar CR/LF/TAB; mapear control y no-ASCII a '.'
+            if ((c >= 32 && c <= 126) || c == '\r' || c == '\n' || c == '\t') {
+                sb.append(c);
+            } else {
+                sb.append('.');
+            }
+        }
+        return sb.toString();
+    }
+
+    private static String previewText(byte[] data, Charset cs, int maxChars) {
+        String s = decodeToString(data, cs);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length() && sb.length() < maxChars; i++) {
+            char c = s.charAt(i);
+            if (c < 32 && c != '\r' && c != '\n' && c != '\t') sb.append('·');
+            else sb.append(c);
+        }
+        if (s.length() > maxChars) sb.append('…');
+        return sb.toString();
+    }
+
+    /* ================== Hexdump ================== */
+
+    private static void writeHexDump(File f, byte[] data) {
+        PrintWriter pw = null;
+        try {
+            pw = new PrintWriter(new OutputStreamWriter(new FileOutputStream(f), "UTF-8"));
+            int i = 0;
+            while (i < data.length) {
+                StringBuilder hex = new StringBuilder();
+                StringBuilder asc = new StringBuilder();
+                int lineLen = Math.min(16, data.length - i);
+                for (int j = 0; j < lineLen; j++) {
+                    int b = data[i + j] & 0xFF;
+                    hex.append(String.format("%02X ", b));
+                    char c = (b >= 32 && b < 127) ? (char) b : '.';
+                    asc.append(c);
+                }
+                for (int j = lineLen; j < 16; j++) hex.append("   ");
+                pw.printf("%08X  %s %s%n", i, hex.toString(), asc.toString());
+                i += lineLen;
+            }
+        } catch (Exception e) {
+            // ignore
+        } finally {
+            try { if (pw != null) pw.close(); } catch (Exception ex) {}
+        }
+    }
+}
