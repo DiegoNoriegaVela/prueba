@@ -1,149 +1,140 @@
-from Crypto.Cipher import DES3, AES
-import configparser
-from Crypto import Random
-import socket
-import struct
-import binascii
-import sys
+import java.io.*;
+import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 
-formato_pinblock = [
-    ("PINBLOCK FORMAT 0 (Code 01)", "PINBLOCK_0"),
-    ("PINBLOCK FORMAT 4 (Code 48 - AES)", "PINBLOCK_4"),
-]
+public class MipSender {
 
-def pad_iso9797_m1(data):
-    if len(data) % 8 != 0:
-        padding_len = 8 - (len(data) % 8)
-        data += b'\x00' * padding_len
-    return data
+    public static void main(String[] args) {
+        String ip      = null;
+        int    port    = -1;
+        String filePath = null;
+        String ipmName  = null;
 
-def generate_pin_block_0(key_raw, pan, pin):
-    # Formatting PAN and PIN
-    formatted_pan = format0_pan(pan)
-    formatted_pin = format0_pin(pin)
-    
-    print("Plain text PIN field ["+formatted_pin+"]")
-    print("Plain text PAN field ["+formatted_pan+"]")
-    
-    pin_bytes = bytes.fromhex(formatted_pin.replace(' ', ''))
-    pan_bytes = bytes.fromhex(formatted_pan.replace(' ', ''))
-    key = bytes.fromhex(key_raw.replace(' ', ''))
-    
-    # XOR PIN PAN
-    val_xor = ''
-    val_xor = bytes(a ^ b for (a, b) in zip(pin_bytes, pan_bytes))
+        // Leer parámetros
+        for (int i = 0; i < args.length; i++) {
+            if ("--ip".equals(args[i]) && i + 1 < args.length) {
+                ip = args[++i];
+            } else if ("--port".equals(args[i]) && i + 1 < args.length) {
+                port = Integer.parseInt(args[++i]);
+            } else if ("--file".equals(args[i]) && i + 1 < args.length) {
+                filePath = args[++i];
+            } else if ("--ipmname".equals(args[i]) && i + 1 < args.length) {
+                ipmName = args[++i];
+            } else {
+                System.err.println("Parámetro desconocido: " + args[i]);
+                printHelp();
+                System.exit(2);
+            }
+        }
+        if (ip == null || port < 0 || filePath == null || ipmName == null) {
+            System.err.println("Faltan parámetros.");
+            printHelp();
+            System.exit(2);
+        }
 
-    padded_data = pad_iso9797_m1(val_xor)
+        Socket socket = null;
+        OutputStream out = null;
+        InputStream in = null;
 
-    # Encrypting PIN Block with TPK
-    cipher = DES3.new(key, DES3.MODE_ECB)
-    encrypted_pin_block = cipher.encrypt(padded_data)
-    enciphered_PIN = encrypted_pin_block.hex().upper()
+        try {
+            // Leer archivo en memoria (o manejar streaming si es muy grande)
+            byte[] fileBytes = readAllBytes(new File(filePath));
+            System.out.println("Leído archivo '" + filePath + "' tamaño: " + fileBytes.length + " bytes");
 
-    return enciphered_PIN
+            // Calcular número de bloques (asumiendo archivo ya en tamaño múltiplo de 1014 bytes)
+            int BLOCK_SIZE = 1014;
+            int numBlocks = (fileBytes.length + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-def format0_pan(pan):
-    pan_format = '0' * 4 + pan
-    return ''.join(pan_format)
+            socket = new Socket(ip, port);
+            out = socket.getOutputStream();
+            in  = socket.getInputStream();
 
-def format0_pin(pin):
-    pin_length = len(pin)
-    pin_length_hex = hex(pin_length)[2:].upper()[:1] 
-    pin_format = '0' + pin_length_hex + pin + 'F' * (14 - pin_length)
-    return ''.join(pin_format)
+            // 1) Enviar Header “004”
+            sendHeader004(out, ipmName);
 
-########################
+            // 2) Enviar cada bloque como Data Record tipo 3
+            for (int blk = 0; blk < numBlocks; blk++) {
+                int offset = blk * BLOCK_SIZE;
+                int remaining = fileBytes.length - offset;
+                int len = remaining >= BLOCK_SIZE ? BLOCK_SIZE : remaining;
 
-def generate_pin_block_4(key_aes_raw, pan, pin):
-    # Formatting PAN and PIN
-    formatted_pan = format4_pan(pan)
-    formatted_pin = format4_pin(pin)
-    
-    print("Plain text PIN field ["+formatted_pin+"]")
-    print("Plain text PAN field ["+formatted_pan+"]")
-    
-    # Padding PIN Block
-    pin_block = bytes.fromhex(formatted_pin.replace(' ', ''))
-    key_aes = bytes.fromhex(key_aes_raw.replace(' ', ''))
+                // Enviamos como “Data Record (3)”
+                sendDataRecord3(out, fileBytes, offset, len, blk + 1, (blk == numBlocks - 1));
+                System.out.println("Enviado bloque " + (blk + 1) + " de " + numBlocks + " (bytes: " + len + ")");
+            }
 
-    # Encrypting PIN Block with TPK
-    mode = AES.MODE_ECB
-    obj = AES.new(key_aes, mode)
-    enc_pin_block = obj.encrypt(pin_block)
-    
-    inter_BK_A = enc_pin_block.hex().upper()
-    xor_interA = bytes.fromhex(inter_BK_A.replace(' ', ''))
-    xor_PAN_in = bytes.fromhex(formatted_pan.replace(' ', ''))
-    
-    # XORing PIN Block with formatted PAN
-    val_inB = ''
-    val_inB = bytes(a ^ b for (a, b) in zip(xor_interA, xor_PAN_in))
-    
-    mode = AES.MODE_ECB
-    obj = AES.new(key_aes, mode)
-    enciphered_PIN_raw = obj.encrypt(val_inB)
-    enciphered_PIN = enciphered_PIN_raw.hex().upper()
+            // 3) Enviar Trailer “998” con conteo = numBlocks + 1
+            sendTrailer998(out, numBlocks + 1);
+            System.out.println("Enviado trailer 998 con conteo: " + (numBlocks + 1));
 
-    return enciphered_PIN
+            out.flush();
 
-def format4_pan(pan):
-    pan_length = len(pan)
-    m_lenght = pan_length - 12
-    m = hex(m_lenght)[2:].upper()[:1]
-    pan_format = (m + pan + '0' * (31 - pan_length)).upper()
-    return ''.join(pan_format)
+            // 4) Leer respuesta del MIP
+            byte[] resp = new byte[1024];
+            int rlen = in.read(resp);
+            if (rlen > 0) {
+                String s = new String(resp, 0, rlen, StandardCharsets.US_ASCII);
+                System.out.println("Respuesta MIP: " + s);
+            } else {
+                System.err.println("No se recibió respuesta del MIP.");
+            }
 
-def format4_pin(pin):
-    pin_length = len(pin)
-    pin_length_hex = hex(pin_length)[2:].upper()[:1] 
-    rnd_file = Random.new()
-    rnd = rnd_file.read(8)
-    rnd_fill = rnd.hex()
-    pin_format = '4' + pin_length_hex + pin + 'F' * (14 - pin_length) + rnd_fill.upper()
-    return ''.join(pin_format)
+            System.out.println("Envio completado.");
 
-#########################
+        } catch (Exception e) {
+            System.err.println("Error en envío: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            try { if (out != null) out.close(); } catch (Exception ex) {}
+            try { if (in  != null) in.close();  } catch (Exception ex) {}
+            try { if (socket != null) socket.close(); } catch (Exception ex) {}
+        }
+    }
 
-def switch_format(option):
-    if option < 1 or option > len(formato_pinblock):
-        print("Opcion no valida!")
-        return
+    private static void printHelp() {
+        System.out.println("Uso:");
+        System.out.println("  java MipSender --ip <MIP_host> --port <MIP_port> --file <archivo.ipm> --ipmname <nombreIPM>");
+        System.out.println("Ejemplo:");
+        System.out.println("  java MipSender --ip 10.0.0.5 --port 12345 --file /data/myfile.ipm --ipmname R11902840");
+    }
 
-    descripcion, opcion = formato_pinblock[option - 1]
-    print(f"\nHas seleccionado: {descripcion}")
+    private static void sendHeader004(OutputStream out, String ipmName) throws IOException {
+        // Según el manual: record tipo “004 To Mastercard File Header”
+        // Construimos: “004” + tipo “01” + “R” + ipmName (ajustar longitud de campos según AN)
+        // Ejemplo sencillo: “00401R” + ipmName + CRLF
+        String rec = "00401R" + ipmName + "\r\n";
+        out.write(rec.getBytes(StandardCharsets.US_ASCII));
+    }
 
-    config = configparser.ConfigParser()
-    config.read("conf_pinblock.ini")
+    private static void sendDataRecord3(OutputStream out, byte[] data, int offset, int len, int blockNumber, boolean isLast) throws IOException {
+        // Construimos el Data Record tipo “3”
+        // Ejemplo: encabezado “3” + datos binarios
+        // Nota: según implementacion real puede necesitar encabezado de longitud etc.
+        out.write('3');
+        out.write(data, offset, len);
+        out.write("\r\n".getBytes(StandardCharsets.US_ASCII));
+    }
 
-    key = config.get(opcion, "key")
-    pan = config.get(opcion, "pan")
-    pin = config.get(opcion, "pin")
-    
-    if(opcion=="PINBLOCK_0"):
-        pin_block = generate_pin_block_0(key, pan, pin)
-        print("Generated PIN Block ISO-0 ["+pin_block+"]")
-    elif(opcion=="PINBLOCK_4"):
-        pin_block = generate_pin_block_4(key, pan, pin)
-        print("Generated PIN Block ISO-4 ["+pin_block+"]")
+    private static void sendTrailer998(OutputStream out, int blockCount) throws IOException {
+        // Construir trailer tipo “998” + conteo big-endian de 4 bytes (por ejemplo) + CRLF
+        String header = "998";
+        byte[] countBytes = ByteBuffer.allocate(4).putInt(blockCount).array();
+        out.write(header.getBytes(StandardCharsets.US_ASCII));
+        out.write(countBytes);
+        out.write("\r\n".getBytes(StandardCharsets.US_ASCII));
+    }
 
-def main():
-    while True:
-        print("Seleccione opcion para EMV:")
-        print("(0) - Salir")
-        print("(1) - PINBLOCK FORMAT 0 (Code 01)")
-        print("(2) - PINBLOCK FORMAT 4 (Code 48) - AES")
-        try:
-            print("Nota: Opciones con ** aun no estan implementadas.")
-            option = int(input("\nSelecciona una opcion (1-2) o 0 para salir: "))
-            
-            if option == 0:
-                print("Saliendo del programa.")
-                break
-            else:
-                switch_format(option)
-                break
-        except ValueError:
-            print("Entrada no valida. Por favor, ingrese un numero.")
-
-if __name__ == "__main__":
-    main()
+    private static byte[] readAllBytes(File f) throws IOException {
+        ByteArrayOutputStream bout = new ByteArrayOutputStream();
+        InputStream in = new FileInputStream(f);
+        try {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) >= 0) {
+                if (n > 0) bout.write(buf, 0, n);
+            }
+        } finally { try { in.close(); } catch (Exception ex) {} }
+        return bout.toByteArray();
+    }
+}
