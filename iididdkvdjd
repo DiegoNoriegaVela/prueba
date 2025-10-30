@@ -1,0 +1,458 @@
+import java.io.*;
+import java.net.*;
+import java.nio.charset.Charset;
+import java.nio.file.*;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.logging.Logger;
+
+/**
+
+- IPMSender - Envío de archivos IPM a Mastercard
+- Cumple con estándar: EBCDIC Cp037 + Layout 1014 bytes
+  */
+  public class IPMSender {
+  private static final Logger logger = Logger.getLogger(IPMSender.class.getName());
+  private static final Charset EBCDIC = Charset.forName(“Cp037”);
+  private static final int BLOCK_SIZE_IPM = 1014; // Estándar Mastercard IPM
+  
+  public static void main(String[] args) {
+  try {
+  if (args.length < 3) {
+  System.err.println(“Uso: java IPMSender <SECCION> <FILE> <YYYYMMDD>”);
+  System.err.println(“Ejemplo: java IPMSender MIP T279 20250130”);
+  System.exit(1);
+  }
+  
+  ```
+       String section = args[0].trim();
+       String fileParam = args[1].trim();
+       String yyyymmdd = args[2].trim();
+  
+       if (!validateDate(yyyymmdd)) {
+           System.err.println("Fecha invalida: " + yyyymmdd);
+           System.exit(2);
+       }
+  
+       // Cargar configuración
+       IniFile ini = IniFile.load(Paths.get("mcsender.ini"));
+       Config config = Config.from(ini, section);
+  
+       // Ejecutar envío
+       sendIPM(config, fileParam, yyyymmdd);
+  
+   } catch (NoSuchFileException e) {
+       System.err.println("INI no encontrado: " + e.getFile());
+       System.exit(3);
+   } catch (Exception e) {
+       System.err.println("Error: " + e.getMessage());
+       e.printStackTrace();
+       System.exit(1);
+   }
+  ```
+  
+  }
+  
+  // ============================== ENVÍO IPM ==============================
+  
+  private static void sendIPM(Config cfg, String fileParam, String yyyymmdd) {
+  logger.info(“╔════════════════════════════════════════════════════════════════╗”);
+  logger.info(“║          ENVÍO IPM A MASTERCARD - Layout 1014 + EBCDIC        ║”);
+  logger.info(“╚════════════════════════════════════════════════════════════════╝”);
+  logger.info(“Host: “ + cfg.host + “:” + cfg.port);
+  
+  ```
+   Path dataFile = Paths.get(cfg.originalFile);
+   Path historyFile = Paths.get(cfg.historyFile);
+  
+   // 1. Leer archivo
+   byte[] payload = readFile(dataFile);
+   if (payload.length == 0) {
+       logger.severe("Archivo vacio o no encontrado: " + dataFile);
+       createHistoryRecord(cfg.defaultFailCode, fileParam, yyyymmdd, historyFile);
+       return;
+   }
+  
+   // 2. Generar nombre de archivo
+   String fileName = applyFormat(cfg.formatSendMC, fileParam, yyyymmdd);
+   logger.info("Nombre archivo: " + fileName);
+   logger.info("Tamaño original: " + payload.length + " bytes");
+  
+   // 3. Convertir a EBCDIC
+   byte[] ebcdicData = convertToEBCDIC(payload);
+   logger.info("Tamaño EBCDIC: " + ebcdicData.length + " bytes");
+  
+   // 4. Dividir en bloques IPM de 1014 bytes con padding
+   List<byte[]> blocks = splitIntoBlocksIPM(ebcdicData);
+   logger.info("Bloques IPM (1014 bytes c/u): " + blocks.size());
+  
+   // 5. Enviar a Mastercard
+   String result = sendToMastercard(cfg, fileName, blocks);
+  
+   // 6. Guardar histórico
+   createHistoryRecord(result, fileParam, yyyymmdd, historyFile);
+   
+   logger.info("═══════════════════════════════════════════════════════════════");
+   logger.info("Estado final: " + result);
+   logger.info("═══════════════════════════════════════════════════════════════");
+  ```
+  
+  }
+  
+  private static String sendToMastercard(Config cfg, String fileName, List<byte[]> blocks) {
+  String result = cfg.defaultFailCode;
+  
+  ```
+   try (Socket socket = new Socket()) {
+       socket.connect(new InetSocketAddress(cfg.host, cfg.port), cfg.connectTimeoutMs);
+       socket.setSoTimeout(cfg.soTimeoutMs);
+       logger.info("Conectado a Mastercard");
+  
+       // 1. Enviar nombre de archivo
+       byte[] nameEBCDIC = fileName.getBytes(EBCDIC);
+       writeFrame(socket, nameEBCDIC);
+       logger.info("→ Nombre enviado: " + fileName + " (" + nameEBCDIC.length + " bytes)");
+  
+       // 2. Enviar bloques IPM
+       for (int i = 0; i < blocks.size(); i++) {
+           writeFrame(socket, blocks.get(i));
+           logger.info("→ Bloque " + (i + 1) + "/" + blocks.size() + " enviado (1014 bytes)");
+       }
+  
+       // 3. Enviar trailer
+       writeTrailer(socket, blocks.size());
+       logger.info("→ Trailer enviado (bloques: " + blocks.size() + ")");
+  
+       // 4. Leer respuesta
+       String response = readResponse(socket);
+       logger.info("← Respuesta Mastercard: [" + response.trim() + "]");
+  
+       // 5. Validar respuesta
+       if (response.contains(cfg.alreadySentSubstring)) {
+           logger.warning("⚠ Archivo ya enviado previamente");
+           result = cfg.defaultFailCode;
+       } else if (containsAcceptedCode(response, cfg.acceptedCodes)) {
+           logger.info("✓ Archivo aceptado por Mastercard");
+           result = cfg.acceptedCodes.get(0);
+       } else {
+           logger.severe("✗ Archivo rechazado por Mastercard");
+           result = cfg.defaultFailCode;
+       }
+  
+   } catch (SocketTimeoutException e) {
+       logger.severe("✗ Timeout esperando respuesta: " + e.getMessage());
+   } catch (IOException e) {
+       logger.severe("✗ Error de comunicación: " + e.getMessage());
+       e.printStackTrace();
+   }
+  
+   return result;
+  ```
+  
+  }
+  
+  // ============================== PROCESAMIENTO IPM ==============================
+  
+  private static byte[] convertToEBCDIC(byte[] asciiData) {
+  try {
+  String content = new String(asciiData, “UTF-8”);
+  return content.getBytes(EBCDIC);
+  } catch (Exception e) {
+  logger.severe(“Error convirtiendo a EBCDIC: “ + e.getMessage());
+  return asciiData;
+  }
+  }
+  
+  private static List<byte[]> splitIntoBlocksIPM(byte[] ebcdicData) {
+  List<byte[]> blocks = new ArrayList<>();
+  int pos = 0;
+  
+  ```
+   while (pos < ebcdicData.length) {
+       // Crear bloque de exactamente 1014 bytes
+       byte[] block = new byte[BLOCK_SIZE_IPM];
+  
+       // Rellenar con espacios EBCDIC (0x40) por defecto
+       Arrays.fill(block, (byte) 0x40);
+  
+       // Copiar datos disponibles
+       int remaining = ebcdicData.length - pos;
+       int copyLength = Math.min(BLOCK_SIZE_IPM, remaining);
+       System.arraycopy(ebcdicData, pos, block, 0, copyLength);
+  
+       blocks.add(block);
+       pos += BLOCK_SIZE_IPM;
+  
+       if (copyLength < BLOCK_SIZE_IPM) {
+           logger.info("  └─ Bloque " + blocks.size() + ": " + copyLength + 
+                      " datos + " + (BLOCK_SIZE_IPM - copyLength) + " padding (0x40)");
+       }
+   }
+  
+   return blocks;
+  ```
+  
+  }
+  
+  // ============================== PROTOCOLO RED ==============================
+  
+  private static void writeFrame(Socket socket, byte[] data) throws IOException {
+  // Header: 2 bytes Big Endian con longitud
+  int len = data.length;
+  byte[] header = new byte[2];
+  header[0] = (byte) ((len >> 8) & 0xFF);
+  header[1] = (byte) (len & 0xFF);
+  
+  ```
+   OutputStream os = socket.getOutputStream();
+   os.write(header);
+   os.write(data);
+   os.flush();
+  ```
+  
+  }
+  
+  private static void writeTrailer(Socket socket, int blockCount) throws IOException {
+  // Trailer: “9980100” (7 bytes) + contador (4 bytes BE) = 11 bytes
+  String okCode = “9980100”;
+  byte[] okBytes = okCode.getBytes(EBCDIC);
+  
+  ```
+   byte[] countBytes = new byte[4];
+   countBytes[0] = (byte) ((blockCount >> 24) & 0xFF);
+   countBytes[1] = (byte) ((blockCount >> 16) & 0xFF);
+   countBytes[2] = (byte) ((blockCount >> 8) & 0xFF);
+   countBytes[3] = (byte) (blockCount & 0xFF);
+  
+   byte[] trailer = new byte[11];
+   System.arraycopy(okBytes, 0, trailer, 0, 7);
+   System.arraycopy(countBytes, 0, trailer, 7, 4);
+  
+   writeFrame(socket, trailer);
+  ```
+  
+  }
+  
+  private static String readResponse(Socket socket) throws IOException {
+  ByteArrayOutputStream baos = new ByteArrayOutputStream();
+  InputStream is = socket.getInputStream();
+  byte[] buf = new byte[4096];
+  int n;
+  
+  ```
+   while (true) {
+       try {
+           n = is.read(buf);
+           if (n == -1) break;
+           baos.write(buf, 0, n);
+           if (n < buf.length) break;
+       } catch (SocketTimeoutException e) {
+           if (baos.size() == 0) throw e;
+           break;
+       }
+   }
+  
+   byte[] ebcdicBytes = baos.toByteArray();
+   if (ebcdicBytes.length == 0) return "";
+   return new String(ebcdicBytes, EBCDIC);
+  ```
+  
+  }
+  
+  // ============================== ARCHIVOS ==============================
+  
+  private static byte[] readFile(Path path) {
+  try {
+  return Files.readAllBytes(path);
+  } catch (IOException e) {
+  logger.severe(“Error leyendo archivo: “ + e.getMessage());
+  return new byte[0];
+  }
+  }
+  
+  private static void createHistoryRecord(String code, String fileName, String date, Path historyPath) {
+  try {
+  String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern(“yyyy-MM-dd HH:mm:ss”));
+  String record = “[” + code + “-” + fileName + “-” + date + “: “ + timestamp + “]”;
+  
+  ```
+       List<String> lines = new ArrayList<>();
+       if (Files.exists(historyPath)) {
+           try {
+               lines = Files.readAllLines(historyPath);
+           } catch (Exception ignored) {}
+       }
+       lines.add(0, record);
+  
+       Files.write(historyPath, String.join(System.lineSeparator(), lines).getBytes(),
+               StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+  
+       logger.info("Histórico actualizado: " + historyPath);
+   } catch (Exception e) {
+       logger.severe("No se pudo actualizar histórico: " + e.getMessage());
+   }
+  ```
+  
+  }
+  
+  // ============================== UTILIDADES ==============================
+  
+  private static String applyFormat(String template, String file, String yyyymmdd) {
+  LocalDate d = LocalDate.parse(yyyymmdd, DateTimeFormatter.BASIC_ISO_DATE);
+  String jul = String.format(”%03d”, d.getDayOfYear());
+  String yy = String.format(”%02d”, d.getYear() % 100);
+  String mm = String.format(”%02d”, d.getMonthValue());
+  String dd = String.format(”%02d”, d.getDayOfMonth());
+  
+  ```
+   return template
+           .replace("{FILE}", file)
+           .replace("{julianDate}", jul)
+           .replace("{yyyymmdd}", yyyymmdd)
+           .replace("{yy}", yy)
+           .replace("{mm}", mm)
+           .replace("{dd}", dd);
+  ```
+  
+  }
+  
+  private static boolean validateDate(String date) {
+  try {
+  LocalDate.parse(date, DateTimeFormatter.BASIC_ISO_DATE);
+  return true;
+  } catch (Exception e) {
+  return false;
+  }
+  }
+  
+  private static boolean containsAcceptedCode(String text, List<String> codes) {
+  if (text == null || codes == null) return false;
+  for (String code : codes) {
+  if (text.contains(code)) return true;
+  }
+  return false;
+  }
+  
+  // ============================== CONFIGURACIÓN ==============================
+  
+  static class Config {
+  final String host;
+  final int port;
+  final int connectTimeoutMs;
+  final int soTimeoutMs;
+  final String originalFile;
+  final String historyFile;
+  final String formatSendMC;
+  final List<String> acceptedCodes;
+  final String alreadySentSubstring;
+  final String defaultFailCode;
+  
+  ```
+   Config(String host, int port, int cto, int sto, String origFile, String histFile,
+          String format, List<String> accepted, String alreadySent, String failCode) {
+       this.host = host;
+       this.port = port;
+       this.connectTimeoutMs = cto;
+       this.soTimeoutMs = sto;
+       this.originalFile = origFile;
+       this.historyFile = histFile;
+       this.formatSendMC = format;
+       this.acceptedCodes = accepted;
+       this.alreadySentSubstring = alreadySent;
+       this.defaultFailCode = failCode;
+   }
+  
+   static Config from(IniFile ini, String section) {
+       // Leer [GENERAL]
+       Map<String, String> general = ini.section("GENERAL");
+       if (general == null) throw new IllegalArgumentException("Falta seccion [GENERAL]");
+  
+       int cto = parseInt(general.getOrDefault("connectTimeoutMs", "60000"), 1000, 300000);
+       int sto = parseInt(general.getOrDefault("soTimeoutMs", "60000"), 1000, 300000);
+       List<String> accepted = parseList(general.getOrDefault("acceptedCode", "9980100"));
+       String alreadySent = general.getOrDefault("alreadySentSubstring", "9288W");
+       String failCode = general.getOrDefault("defaultFailCode", "9980101");
+  
+       // Leer sección de negocio
+       Map<String, String> biz = ini.section(section);
+       if (biz == null) throw new IllegalArgumentException("No existe seccion [" + section + "]");
+  
+       String hostRef = biz.getOrDefault("hostRef", biz.getOrDefault("hostSection", "HOST_MC"));
+       Map<String, String> hostSec = ini.section(hostRef);
+       if (hostSec == null) throw new IllegalArgumentException("No existe seccion [" + hostRef + "]");
+  
+       String host = require(hostSec, "host");
+       int port = parseInt(require(hostSec, "port"), 1, 65535);
+  
+       String origFile = require(biz, "originalFile");
+       String histFile = require(biz, "historyFile");
+       String format = require(biz, "formatSendMC");
+  
+       return new Config(host, port, cto, sto, origFile, histFile, format, accepted, alreadySent, failCode);
+   }
+  
+   private static String require(Map<String, String> map, String key) {
+       String val = map.get(key);
+       if (val == null || val.trim().isEmpty())
+           throw new IllegalArgumentException("Falta clave: " + key);
+       return val.trim();
+   }
+  
+   private static int parseInt(String s, int min, int max) {
+       int v = Integer.parseInt(s.trim());
+       if (v < min || v > max)
+           throw new IllegalArgumentException("Valor fuera de rango: " + s + " (" + min + "-" + max + ")");
+       return v;
+   }
+  
+   private static List<String> parseList(String csv) {
+       List<String> out = new ArrayList<>();
+       for (String p : csv.split(",")) {
+           String t = p.trim();
+           if (!t.isEmpty()) out.add(t);
+       }
+       return out;
+   }
+  ```
+  
+  }
+  
+  // ============================== INI PARSER ==============================
+  
+  static class IniFile {
+  private final Map<String, Map<String, String>> data = new LinkedHashMap<>();
+  
+  ```
+   static IniFile load(Path path) throws IOException {
+       if (!Files.exists(path)) throw new NoSuchFileException(path.toString());
+       IniFile ini = new IniFile();
+       Map<String, String> current = null;
+  
+       for (String raw : Files.readAllLines(path)) {
+           String line = raw.trim();
+           if (line.isEmpty() || line.startsWith("#") || line.startsWith(";")) continue;
+  
+           if (line.startsWith("[") && line.endsWith("]")) {
+               String name = line.substring(1, line.length() - 1).trim();
+               current = new LinkedHashMap<>();
+               ini.data.put(name, current);
+           } else if (current != null) {
+               int p = line.indexOf('=');
+               if (p > 0) {
+                   String k = line.substring(0, p).trim();
+                   String v = line.substring(p + 1).trim();
+                   current.put(k, v);
+               }
+           }
+       }
+       return ini;
+   }
+  
+   Map<String, String> section(String name) {
+       return data.get(name);
+   }
+  ```
+  
+  }
+  }
