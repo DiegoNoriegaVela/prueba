@@ -1,0 +1,286 @@
+import java.io.*;
+import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * RDW1014 decoder para archivos IPM (Mastercard).
+ *
+ * Funciona así:
+ *  - (Opcional) Quita el "1014-blocking": de cada bloque de 1014 bytes toma solo 1012;
+ *    los 2 últimos suelen ser x'40' (EBCDIC space). El último bloque puede venir paddeado con x'40'.
+ *  - Parsea registros VBS con RDW:
+ *      * Variante IPM: RDW = 4 bytes big-endian con longitud del payload (sin contar el RDW).
+ *        Fin de archivo: RDW = 0x00000000.
+ *      * Variante IBM: RDW = 2 bytes (BE) con longitud total (incluye RDW) + 2 bytes de flags (normalmente 0x0000).
+ *        Fin de archivo: se asume cuando no hay más datos o la longitud es inválida.
+ *
+ * Uso:
+ *   java Rdw1014Tool decode --input <ruta> [--outdir out] [--encoding Cp500]
+ *                           [--blocked auto|true|false] [--rdw auto|ipm|ibm]
+ *
+ * Ejemplos:
+ *   java Rdw1014Tool decode --input YTF.ARR119.M.TEST.ipm --outdir out --encoding Cp500 --blocked auto --rdw auto
+ *   java Rdw1014Tool decode --input sample.ipm --blocked true --rdw ipm
+ *
+ * Salida:
+ *   - out/record_0001.bin, out/record_0002.bin, ...
+ *   - out/report.txt con longitudes y un preview de texto (decodificado con el encoding indicado).
+ */
+public class Rdw1014Tool {
+
+    enum Blocked1014 { AUTO, TRUE, FALSE }
+    enum RdwVariant { AUTO, IPM, IBM }
+
+    private static final int BLOCK_SIZE = 1014;
+    private static final int DATA_PER_BLOCK = 1012;
+    private static final byte PAD_40 = 0x40;
+
+    public static void main(String[] args) {
+        if (args.length == 0 || "help".equalsIgnoreCase(args[0])) {
+            printHelp();
+            return;
+        }
+        String cmd = args[0].toLowerCase();
+        if (!"decode".equals(cmd)) {
+            System.err.println("Comando no soportado: " + cmd);
+            printHelp();
+            System.exit(2);
+        }
+
+        // Defaults
+        String inputPath = null;
+        Path outdir = Path.of("out");
+        String encoding = "Cp500";          // EBCDIC internacional (≈ CCSID 500/1148)
+        Blocked1014 blocked = Blocked1014.AUTO;
+        RdwVariant rdw = RdwVariant.AUTO;
+
+        // Parse flags
+        for (int i = 1; i < args.length; i++) {
+            switch (args[i]) {
+                case "--input":      inputPath = args[++i]; break;
+                case "--outdir":     outdir = Path.of(args[++i]); break;
+                case "--encoding":   encoding = args[++i]; break;
+                case "--blocked":
+                    String b = args[++i].toLowerCase();
+                    blocked = switch (b) {
+                        case "true" -> Blocked1014.TRUE;
+                        case "false" -> Blocked1014.FALSE;
+                        default -> Blocked1014.AUTO;
+                    };
+                    break;
+                case "--rdw":
+                    String r = args[++i].toLowerCase();
+                    rdw = switch (r) {
+                        case "ipm" -> RdwVariant.IPM;
+                        case "ibm" -> RdwVariant.IBM;
+                        default -> RdwVariant.AUTO;
+                    };
+                    break;
+                default:
+                    System.err.println("Flag desconocida: " + args[i]);
+                    printHelp();
+                    System.exit(2);
+            }
+        }
+        if (inputPath == null) {
+            System.err.println("Falta --input <ruta>");
+            printHelp();
+            System.exit(2);
+        }
+
+        try {
+            Files.createDirectories(outdir);
+            byte[] raw = Files.readAllBytes(Path.of(inputPath));
+
+            // 1) ¿Está 1014-blocked?
+            boolean isBlocked = decideBlocked(raw, blocked);
+            if (isBlocked) {
+                System.out.printf("Detectado 1014-blocking (modo %s). Desbloqueando…%n", blocked);
+            } else {
+                System.out.printf("No se aplicará 1014-unblocking (modo %s).%n", blocked);
+            }
+
+            byte[] vbs = isBlocked ? remove1014Blocking(raw) : raw;
+
+            // 2) ¿Qué variante RDW parece?
+            RdwVariant variant = decideRdw(vbs, rdw);
+            System.out.println("Variante RDW a usar: " + variant);
+
+            // 3) Parseo de registros
+            List<byte[]> records = parseVbs(vbs, variant);
+
+            // 4) Guardar y reportar
+            Path report = outdir.resolve("report.txt");
+            try (BufferedWriter w = Files.newBufferedWriter(report)) {
+                Charset cs;
+                try {
+                    cs = Charset.forName(encoding);
+                } catch (Exception e) {
+                    System.err.println("Encoding no válido (" + encoding + "), usando Cp500 por defecto.");
+                    cs = Charset.forName("Cp500");
+                }
+
+                w.write("Archivo: " + inputPath + System.lineSeparator());
+                w.write("Tamaño original: " + raw.length + " bytes" + System.lineSeparator());
+                w.write("1014-blocked: " + isBlocked + System.lineSeparator());
+                w.write("Variante RDW: " + variant + System.lineSeparator());
+                w.write("Registros: " + records.size() + System.lineSeparator());
+                w.write("Encoding texto para preview: " + cs.displayName() + System.lineSeparator());
+                w.write("------------------------------------------------------------" + System.lineSeparator());
+
+                int idx = 1;
+                for (byte[] rec : records) {
+                    Path out = outdir.resolve(String.format("record_%04d.bin", idx));
+                    Files.write(out, rec);
+                    String preview = previewText(rec, cs, 64);
+                    w.write(String.format("#%04d  len=%d  -> %s%n", idx, rec.length, preview));
+                    idx++;
+                }
+            }
+            System.out.println("OK. Registros guardados y reporte en: " + report.toAbsolutePath());
+            System.out.println("Siguiente paso habitual: abrir los BIN con tu parser IPM/ISO8583 o con herramientas de validación.");
+
+        } catch (Exception e) {
+            System.err.println("Fallo: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(1);
+        }
+    }
+
+    private static void printHelp() {
+        System.out.println("""
+            Uso:
+              java Rdw1014Tool decode --input <ruta> [--outdir out] [--encoding Cp500]
+                                       [--blocked auto|true|false] [--rdw auto|ipm|ibm]
+
+            Notas:
+              - --encoding: EBCDIC a usar para los previews (Cp500, Cp037, Cp1148, Cp284, Cp1047...).
+              - --blocked:
+                    auto   -> intenta detectar si está en 1014-blocking (por tamaño y pies x'40').
+                    true   -> forzar a quitar 1014-blocking.
+                    false  -> no quitar 1014-blocking.
+              - --rdw:
+                    auto   -> detecta: IPM (4 bytes) si cuadra; si no, IBM (2+2).
+                    ipm    -> fuerza RDW de 4 bytes big-endian = longitud del payload (sin RDW).
+                    ibm    -> fuerza RDW IBM: 2 bytes longitud total (incl. RDW) + 2 bytes flags.
+            """);
+    }
+
+    /* ---------- Detección y manejo 1014-blocking ---------- */
+
+    private static boolean decideBlocked(byte[] raw, Blocked1014 mode) {
+        if (mode == Blocked1014.TRUE) return true;
+        if (mode == Blocked1014.FALSE) return false;
+
+        // AUTO: heurística
+        if (raw.length >= BLOCK_SIZE && raw.length % BLOCK_SIZE == 0) {
+            // Muestrea algunos bloques: si los 2 últimos bytes son 0x40, 0x40 la mayoría de veces → blocked
+            int checks = Math.min(8, raw.length / BLOCK_SIZE);
+            int hits = 0;
+            for (int i = 0; i < checks; i++) {
+                int end = (i + 1) * BLOCK_SIZE;
+                byte b1 = raw[end - 2], b2 = raw[end - 1];
+                if (b1 == PAD_40 && b2 == PAD_40) hits++;
+            }
+            return hits >= Math.max(3, checks - 1); // mayoría
+        }
+        return false;
+    }
+
+    private static byte[] remove1014Blocking(byte[] raw) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(raw.length);
+        int pos = 0;
+        while (pos < raw.length) {
+            int remaining = raw.length - pos;
+            int take = Math.min(DATA_PER_BLOCK, remaining);
+            // datos
+            out.write(raw, pos, Math.min(take, remaining));
+            pos += BLOCK_SIZE; // saltamos todo el bloque (incluyendo los 2 bytes de padding)
+        }
+        return out.toByteArray();
+    }
+
+    /* ---------- Detección y parseo RDW ---------- */
+
+    private static RdwVariant decideRdw(byte[] vbs, RdwVariant mode) {
+        if (mode != RdwVariant.AUTO) return mode;
+        if (vbs.length < 4) return RdwVariant.IPM; // fallback
+
+        int b0 = vbs[0] & 0xFF, b1 = vbs[1] & 0xFF, b2 = vbs[2] & 0xFF, b3 = vbs[3] & 0xFF;
+
+        // Candidato IBM: b2,b3 suelen ser 0x00,0x00; len>=4 y razonable
+        int lenIBM = (b0 << 8) | b1;
+        boolean looksIBM = (b2 == 0 && b3 == 0 && lenIBM >= 4 && lenIBM <= vbs.length);
+
+        // Candidato IPM: int32BE razonable (no gigantesco, no 0 al inicio)
+        int lenIPM = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+        boolean looksIPM = (lenIPM > 0 && lenIPM <= vbs.length);
+
+        if (looksIPM && !looksIBM) return RdwVariant.IPM;
+        if (looksIBM && !looksIPM) return RdwVariant.IBM;
+
+        // Si ambos podrían, prioriza IPM (más frecuente en archivos IPM actuales)
+        return RdwVariant.IPM;
+    }
+
+    private static List<byte[]> parseVbs(byte[] vbs, RdwVariant variant) throws IOException {
+        List<byte[]> records = new ArrayList<>();
+        int pos = 0;
+
+        while (pos + 4 <= vbs.length) {
+            if (variant == RdwVariant.IPM) {
+                int len = ((vbs[pos] & 0xFF) << 24) | ((vbs[pos + 1] & 0xFF) << 16)
+                        | ((vbs[pos + 2] & 0xFF) << 8) | (vbs[pos + 3] & 0xFF);
+                pos += 4;
+
+                // EOF RDW = 0x00000000
+                if (len == 0) break;
+
+                if (len < 0 || pos + len > vbs.length) {
+                    throw new IOException("RDW(IPM) inválido en pos " + (pos - 4) + " len=" + len);
+                }
+                byte[] rec = new byte[len];
+                System.arraycopy(vbs, pos, rec, 0, len);
+                pos += len;
+                records.add(rec);
+
+            } else { // IBM 2+2
+                int total = ((vbs[pos] & 0xFF) << 8) | (vbs[pos + 1] & 0xFF);
+                int flags = ((vbs[pos + 2] & 0xFF) << 8) | (vbs[pos + 3] & 0xFF);
+                pos += 4;
+
+                if (total < 4 || pos + (total - 4) > vbs.length) {
+                    throw new IOException("RDW(IBM) inválido en pos " + (pos - 4) + " total=" + total + " flags=" + flags);
+                }
+                int payloadLen = total - 4;
+                byte[] rec = new byte[payloadLen];
+                System.arraycopy(vbs, pos, rec, 0, payloadLen);
+                pos += payloadLen;
+
+                // Nota: no manejamos aquí lógicas de "spanned" a nivel de bloques porque ya
+                // removimos el blocking y el stream VBS quedó lineal.
+                records.add(rec);
+            }
+        }
+        return records;
+    }
+
+    /* ---------- Utilidades ---------- */
+
+    private static String previewText(byte[] data, Charset cs, int maxChars) {
+        try {
+            String s = new String(data, cs);
+            // Limpia no-imprimibles para que el reporte sea legible
+            String cleaned = s.replaceAll("[\\p{Cntrl}&&[^\r\n\t]]", "·");
+            if (cleaned.length() > maxChars) {
+                return cleaned.substring(0, maxChars) + "…";
+            }
+            return cleaned;
+        } catch (Exception e) {
+            return "(no preview: " + e.getMessage() + ")";
+        }
+    }
+}
