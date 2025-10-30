@@ -1,140 +1,215 @@
 import java.io.*;
-import java.net.Socket;
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
+import java.net.*;
+import java.nio.charset.Charset;
+import java.util.Calendar;
 
-public class MipSender {
+public final class MipFileSender {
+
+    private static final Charset EBCDIC = Charset.forName("Cp500");
+    private static final int DATA_CHUNK = 1014;
 
     public static void main(String[] args) {
-        String ip      = null;
-        int    port    = -1;
-        String filePath = null;
-        String ipmName  = null;
-
-        // Leer parámetros
-        for (int i = 0; i < args.length; i++) {
-            if ("--ip".equals(args[i]) && i + 1 < args.length) {
-                ip = args[++i];
-            } else if ("--port".equals(args[i]) && i + 1 < args.length) {
-                port = Integer.parseInt(args[++i]);
-            } else if ("--file".equals(args[i]) && i + 1 < args.length) {
-                filePath = args[++i];
-            } else if ("--ipmname".equals(args[i]) && i + 1 < args.length) {
-                ipmName = args[++i];
-            } else {
-                System.err.println("Parámetro desconocido: " + args[i]);
-                printHelp();
-                System.exit(2);
-            }
-        }
-        if (ip == null || port < 0 || filePath == null || ipmName == null) {
-            System.err.println("Faltan parámetros.");
-            printHelp();
-            System.exit(2);
-        }
-
-        Socket socket = null;
-        OutputStream out = null;
-        InputStream in = null;
-
         try {
-            // Leer archivo en memoria (o manejar streaming si es muy grande)
-            byte[] fileBytes = readAllBytes(new File(filePath));
-            System.out.println("Leído archivo '" + filePath + "' tamaño: " + fileBytes.length + " bytes");
-
-            // Calcular número de bloques (asumiendo archivo ya en tamaño múltiplo de 1014 bytes)
-            int BLOCK_SIZE = 1014;
-            int numBlocks = (fileBytes.length + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-            socket = new Socket(ip, port);
-            out = socket.getOutputStream();
-            in  = socket.getInputStream();
-
-            // 1) Enviar Header “004”
-            sendHeader004(out, ipmName);
-
-            // 2) Enviar cada bloque como Data Record tipo 3
-            for (int blk = 0; blk < numBlocks; blk++) {
-                int offset = blk * BLOCK_SIZE;
-                int remaining = fileBytes.length - offset;
-                int len = remaining >= BLOCK_SIZE ? BLOCK_SIZE : remaining;
-
-                // Enviamos como “Data Record (3)”
-                sendDataRecord3(out, fileBytes, offset, len, blk + 1, (blk == numBlocks - 1));
-                System.out.println("Enviado bloque " + (blk + 1) + " de " + numBlocks + " (bytes: " + len + ")");
-            }
-
-            // 3) Enviar Trailer “998” con conteo = numBlocks + 1
-            sendTrailer998(out, numBlocks + 1);
-            System.out.println("Enviado trailer 998 con conteo: " + (numBlocks + 1));
-
-            out.flush();
-
-            // 4) Leer respuesta del MIP
-            byte[] resp = new byte[1024];
-            int rlen = in.read(resp);
-            if (rlen > 0) {
-                String s = new String(resp, 0, rlen, StandardCharsets.US_ASCII);
-                System.out.println("Respuesta MIP: " + s);
-            } else {
-                System.err.println("No se recibió respuesta del MIP.");
-            }
-
-            System.out.println("Envio completado.");
-
+            Params p = Params.parse(args);
+            if (p == null) { usage(); System.exit(2); }
+            sendToMip(p);
         } catch (Exception e) {
-            System.err.println("Error en envío: " + e.getMessage());
             e.printStackTrace();
-        } finally {
-            try { if (out != null) out.close(); } catch (Exception ex) {}
-            try { if (in  != null) in.close();  } catch (Exception ex) {}
-            try { if (socket != null) socket.close(); } catch (Exception ex) {}
+            System.exit(1);
         }
     }
 
-    private static void printHelp() {
-        System.out.println("Uso:");
-        System.out.println("  java MipSender --ip <MIP_host> --port <MIP_port> --file <archivo.ipm> --ipmname <nombreIPM>");
-        System.out.println("Ejemplo:");
-        System.out.println("  java MipSender --ip 10.0.0.5 --port 12345 --file /data/myfile.ipm --ipmname R11902840");
+    private static void usage() {
+        System.out.println(
+          "Uso:\n" +
+          "  java MipFileSender --ip <host> --port <puerto> --file <path_ipm> --ipmname <R119xxxxx[dddss]>\n" +
+          "Notas:\n" +
+          "  --ipmname: 9 chars (R+tipo3+endpoint5) o 14 chars (RtttEEEEEJJJSS).\n");
     }
 
-    private static void sendHeader004(OutputStream out, String ipmName) throws IOException {
-        // Según el manual: record tipo “004 To Mastercard File Header”
-        // Construimos: “004” + tipo “01” + “R” + ipmName (ajustar longitud de campos según AN)
-        // Ejemplo sencillo: “00401R” + ipmName + CRLF
-        String rec = "00401R" + ipmName + "\r\n";
-        out.write(rec.getBytes(StandardCharsets.US_ASCII));
-    }
+    private static void sendToMip(Params p) throws Exception {
+        String txId = normalizeTransmissionId(p.ipmName);
 
-    private static void sendDataRecord3(OutputStream out, byte[] data, int offset, int len, int blockNumber, boolean isLast) throws IOException {
-        // Construimos el Data Record tipo “3”
-        // Ejemplo: encabezado “3” + datos binarios
-        // Nota: según implementacion real puede necesitar encabezado de longitud etc.
-        out.write('3');
-        out.write(data, offset, len);
-        out.write("\r\n".getBytes(StandardCharsets.US_ASCII));
-    }
+        File f = new File(p.filePath);
+        if (!f.exists() || !f.isFile()) throw new FileNotFoundException("No existe el archivo: " + f.getAbsolutePath());
 
-    private static void sendTrailer998(OutputStream out, int blockCount) throws IOException {
-        // Construir trailer tipo “998” + conteo big-endian de 4 bytes (por ejemplo) + CRLF
-        String header = "998";
-        byte[] countBytes = ByteBuffer.allocate(4).putInt(blockCount).array();
-        out.write(header.getBytes(StandardCharsets.US_ASCII));
-        out.write(countBytes);
-        out.write("\r\n".getBytes(StandardCharsets.US_ASCII));
-    }
+        System.out.println("INICIA PROCESO");
+        System.out.println("Archivo: " + f.getAbsolutePath());
+        System.out.println("Transmission ID: " + txId);
 
-    private static byte[] readAllBytes(File f) throws IOException {
-        ByteArrayOutputStream bout = new ByteArrayOutputStream();
-        InputStream in = new FileInputStream(f);
+        Socket sock = new Socket();
+        sock.connect(new InetSocketAddress(p.ip, p.port), 15000);
+        sock.setSoTimeout(20000);
+
+        InputStream in = sock.getInputStream();
+        OutputStream out = sock.getOutputStream();
+
         try {
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = in.read(buf)) >= 0) {
-                if (n > 0) bout.write(buf, 0, n);
+            // 1) Header 004
+            byte[] hdr004 = buildHeader004(txId);
+            writeFramed(out, hdr004);
+            Frame r = readFramed(in);
+            check998("Header", r);
+
+            // 2) Data (3): 'R' + 1014 bytes máx por bloque
+            int blocks = 0;
+            FileInputStream fis = new FileInputStream(f);
+            try {
+                byte[] buf = new byte[DATA_CHUNK];
+                int n;
+                while ((n = fis.read(buf)) >= 0) {
+                    if (n == 0) break;
+                    ByteArrayOutputStream rec = new ByteArrayOutputStream(1 + n);
+                    rec.write(ebcdicByte('R'));    // dirección Host->MIP
+                    rec.write(buf, 0, n);          // datos
+                    writeFramed(out, rec.toByteArray());
+                    blocks++;
+                }
+            } finally { try { fis.close(); } catch (Exception ignore) {} }
+
+            // 3) Trailer 998
+            byte[] tr998 = buildTrailer998(blocks);
+            writeFramed(out, tr998);
+            r = readFramed(in);
+            check998("Trailer", r);
+
+            // 4) Purge 999 + ACK
+            byte[] p999 = buildPurge999(txId);
+            writeFramed(out, p999);
+            r = readFramed(in);
+            check998("Purge", r);
+
+            System.out.println("ENVÍO COMPLETADO. Bloques de datos: " + blocks + " (más trailer).");
+            System.out.println("PROCESO FINALIZADO");
+        } finally {
+            try { sock.close(); } catch (Exception ignore) {}
+        }
+    }
+
+    // ----- Builders -----------------------------------------------------------
+
+    private static byte[] buildHeader004(String txId14) throws IOException {
+        ByteArrayOutputStream b = new ByteArrayOutputStream(36);
+        b.write(ebcdic("004"));  // 1-3
+        b.write(ebcdic("01"));   // 4-5
+        b.write(ebcdic(txId14)); // 6-19
+        for (int i = 0; i < 17; i++) b.write(0x00); // 20-36 reservados
+        return b.toByteArray();
+    }
+
+    private static byte[] buildTrailer998(int dataBlocks) throws IOException {
+        int count = dataBlocks + 1; // incluye el propio trailer
+        ByteArrayOutputStream b = new ByteArrayOutputStream(11);
+        b.write(ebcdic("998"));  // 1-3
+        b.write(ebcdic("01"));   // 4-5
+        b.write(ebcdic("00"));   // 6-7 Return Code
+        b.write(intTo4BE(count)); // 8-11 binario BE
+        return b.toByteArray();
+    }
+
+    private static byte[] buildPurge999(String txId14) throws IOException {
+        ByteArrayOutputStream b = new ByteArrayOutputStream(21);
+        b.write(ebcdic("999"));     // 1-3
+        b.write(ebcdic("01"));      // 4-5
+        b.write(ebcdic("00"));      // 6-7
+        b.write(ebcdic(txId14));    // 8-21
+        return b.toByteArray();
+    }
+
+    // ----- Framing (long=2 bytes BE + payload) --------------------------------
+
+    private static void writeFramed(OutputStream out, byte[] payload) throws IOException {
+        int len = payload.length;
+        out.write((len >>> 8) & 0xFF);
+        out.write(len & 0xFF);
+        out.write(payload);
+        out.flush();
+    }
+
+    private static Frame readFramed(InputStream in) throws IOException {
+        int hi = in.read(), lo = in.read();
+        if (hi < 0 || lo < 0) throw new EOFException("Conexión cerrada esperando longitud");
+        int len = ((hi & 0xFF) << 8) | (lo & 0xFF);
+        byte[] buf = new byte[len];
+        int off = 0;
+        while (off < len) {
+            int n = in.read(buf, off, len - off);
+            if (n < 0) throw new EOFException("Conexión cerrada leyendo frame");
+            off += n;
+        }
+        return new Frame(buf);
+    }
+
+    private static void check998(String stage, Frame f) {
+        String code = f.asEbcdic(0, 3); // "998"
+        if (!"998".equals(code)) {
+            System.out.println(stage + " resp: no es 998, raw=" + f.hex());
+            return; // algunos line acks no-998 pueden aparecer
+        }
+        String type = f.asEbcdic(3, 2); // "01"
+        String rc   = f.asEbcdic(5, 2); // "00"
+        System.out.println(stage + " resp: 998/" + type + " rc=" + rc);
+        if (!"00".equals(rc)) {
+            throw new RuntimeException(stage + " rechazado por MIP (rc=" + rc + ")");
+        }
+    }
+
+    // ----- Utilidades ---------------------------------------------------------
+
+    private static byte[] ebcdic(String s) { return s.getBytes(EBCDIC); }
+    private static byte ebcdicByte(char c) { return ("" + c).getBytes(EBCDIC)[0]; }
+
+    private static byte[] intTo4BE(int v) {
+        return new byte[] {
+            (byte)((v >>> 24) & 0xFF),
+            (byte)((v >>> 16) & 0xFF),
+            (byte)((v >>> 8)  & 0xFF),
+            (byte)(v & 0xFF)
+        };
+    }
+
+    private static String normalizeTransmissionId(String raw) {
+        if (raw == null) throw new IllegalArgumentException("--ipmname requerido");
+        String s = raw.trim();
+        if (s.length() == 14) return s;
+        if (s.length() != 9) throw new IllegalArgumentException("--ipmname debe ser 9 o 14 chars (ej: R11902840)");
+        Calendar cal = Calendar.getInstance();
+        int dayOfYear = cal.get(Calendar.DAY_OF_YEAR); // 1..366
+        return s + String.format("%03d", dayOfYear) + "01"; // DDD + SS
+    }
+
+    private static final class Frame {
+        final byte[] data;
+        Frame(byte[] d) { this.data = d; }
+
+        String asEbcdic(int start, int len) {
+            if (start + len > data.length) return "";
+            return new String(data, start, len, EBCDIC);
+        }
+        String hex() {
+            StringBuilder sb = new StringBuilder();
+            for (byte b : data) sb.append(String.format("%02X", b));
+            return sb.toString();
+        }
+    }
+
+    private static final class Params {
+        String ip; int port; String filePath; String ipmName;
+        static Params parse(String[] a) {
+            Params p = new Params();
+            for (int i = 0; i < a.length; i++) {
+                String s = a[i];
+                if (s.equals("--ip") && i + 1 < a.length) p.ip = a[++i];
+                else if (s.startsWith("--ip=")) p.ip = s.substring(5);
+                else if (s.equals("--port") && i + 1 < a.length) p.port = Integer.parseInt(a[++i]);
+                else if (s.startsWith("--port=")) p.port = Integer.parseInt(s.substring(7));
+                else if (s.equals("--file") && i + 1 < a.length) p.filePath = a[++i];
+                else if (s.startsWith("--file=")) p.filePath = s.substring(7);
+                else if (s.equals("--ipmname") && i + 1 < a.length) p.ipmName = a[++i];
+                else if (s.startsWith("--ipmname=")) p.ipmName = s.substring(10);
             }
-        } finally { try { in.close(); } catch (Exception ex) {} }
-        return bout.toByteArray();
+            if (p.ip == null || p.port == 0 || p.filePath == null || p.ipmName == null) return null;
+            return p;
+        }
     }
 }
