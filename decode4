@@ -1,0 +1,132 @@
+import java.io.*;
+
+public class Rdw1014Simple {
+
+    // ---- configuracion fija ----
+    private static final int BLOCK_SIZE = 1014;
+    private static final int DATA_PER_BLOCK = 1012;
+    private static final byte PAD_40 = 0x40;
+    private static final String EBCDIC_ENCODING = "Cp500"; // IBM500
+
+    public static void main(String[] args) {
+        if (args.length != 2) {
+            System.out.println("uso: java Rdw1014Simple <inputFile> <outputDir>");
+            System.out.println("ejemplo: java Rdw1014Simple /path/file.ipm /path/out");
+            System.exit(1);
+        }
+
+        String inputPath = args[0];
+        String outDir = args[1];
+
+        try {
+            File out = new File(outDir);
+            if (!out.exists()) out.mkdirs();
+
+            byte[] raw = readAllBytes(new File(inputPath));
+
+            // 1) quitar 1014-blocking (se asume siempre RDW1014)
+            byte[] vbs = remove1014Blocking(raw);
+
+            // 2) parsear RDW IPM (4 bytes BE = longitud payload; 0 = EOF)
+            int pos = 0;
+            int count = 0;
+            while (pos + 4 <= vbs.length) {
+                int len = ((vbs[pos] & 0xFF) << 24) | ((vbs[pos + 1] & 0xFF) << 16)
+                        | ((vbs[pos + 2] & 0xFF) << 8) | (vbs[pos + 3] & 0xFF);
+                pos += 4;
+
+                if (len == 0) break; // fin del archivo VBS
+
+                if (len < 0 || pos + len > vbs.length) {
+                    throw new IOException("RDW invalido en pos " + (pos - 4) + " len=" + len);
+                }
+
+                byte[] rec = new byte[len];
+                System.arraycopy(vbs, pos, rec, 0, len);
+                pos += len;
+
+                count++;
+                String base = String.format("record_%04d", count);
+
+                // .bin crudo
+                writeAllBytes(new File(out, base + ".bin"), rec);
+
+                // texto EBCDIC
+                String ebcdicText = decodeEbcdic(rec, EBCDIC_ENCODING);
+                writeText(new File(out, base + ".ebcdic.txt"), ebcdicText, "UTF-8");
+
+                // texto ASCII legible (sustituye no imprimibles por '.')
+                String asciiText = toAsciiPrintable(ebcdicText);
+                writeText(new File(out, base + ".ascii.txt"), asciiText, "US-ASCII");
+            }
+
+            System.out.println("ok. registros extraidos: " + count);
+            System.out.println("salida en: " + out.getAbsolutePath());
+
+        } catch (Exception e) {
+            System.err.println("error: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(2);
+        }
+    }
+
+    // ---- helpers ----
+
+    private static byte[] readAllBytes(File f) throws IOException {
+        ByteArrayOutputStream bout = new ByteArrayOutputStream((int)Math.min(f.length(), 64*1024));
+        byte[] buf = new byte[8192];
+        InputStream in = new FileInputStream(f);
+        try {
+            int n;
+            while ((n = in.read(buf)) >= 0) {
+                if (n > 0) bout.write(buf, 0, n);
+            }
+        } finally { try { in.close(); } catch (Exception ex) {} }
+        return bout.toByteArray();
+    }
+
+    // quita 1014-blocking: de cada bloque toma 1012 bytes y omite los 2 de pad x'40'
+    private static byte[] remove1014Blocking(byte[] raw) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(raw.length);
+        int pos = 0;
+        while (pos < raw.length) {
+            int remaining = raw.length - pos;
+            if (remaining >= BLOCK_SIZE) {
+                out.write(raw, pos, DATA_PER_BLOCK); // 1012 datos
+                pos += BLOCK_SIZE;                    // saltar +2 pad
+            } else {
+                // ultimo bloque parcial (si lo hubiera): tomar hasta 1012
+                int take = remaining < DATA_PER_BLOCK ? remaining : DATA_PER_BLOCK;
+                if (take > 0) out.write(raw, pos, take);
+                pos += remaining;
+            }
+        }
+        return out.toByteArray();
+    }
+
+    private static void writeAllBytes(File f, byte[] data) throws IOException {
+        OutputStream out = new FileOutputStream(f);
+        try { out.write(data); } finally { try { out.close(); } catch (Exception ex) {} }
+    }
+
+    private static void writeText(File f, String s, String charset) throws IOException {
+        OutputStreamWriter w = new OutputStreamWriter(new FileOutputStream(f), charset);
+        try { w.write(s); } finally { try { w.close(); } catch (Exception ex) {} }
+    }
+
+    private static String decodeEbcdic(byte[] data, String cs) {
+        try { return new String(data, cs); }
+        catch (Exception e) { return ""; }
+    }
+
+    private static String toAsciiPrintable(String s) {
+        if (s == null) return "";
+        StringBuffer sb = new StringBuffer(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if ((c >= 32 && c <= 126) || c == '\r' || c == '\n' || c == '\t') sb.append(c);
+            else sb.append('.');
+        }
+        return sb.toString();
+    }
+}
